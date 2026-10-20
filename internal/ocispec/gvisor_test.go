@@ -16,6 +16,8 @@ package ocispec
 
 import (
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -127,3 +129,111 @@ func TestShapeGVisor_SystemMounts(t *testing.T) {
 		})
 	}
 }
+
+// Upstream #2765 removed TestShapeGVisorBindsTheNamedResolvConf (ShapeGVisor no
+// longer binds resolv.conf -- gVisor writes it into the rootfs via
+// actornet.WriteRootfsEtcFiles). Our nested-image-store test below is kept.
+
+// TestShapeGVisor_NestedImageStore proves the nested image store directly at the shaper (both the
+// writeSpec caller and this shaper guard the sandbox root container; this test pins
+// the shaper's own guard so removing it is caught). It also proves the mount is
+// gVisor-only: ShapeMicroVM adds nothing at the path.
+func TestShapeGVisor_NestedImageStore(t *testing.T) {
+	const store = NestedImageStorePath
+
+	shapeGVisor := func(containerName string, nis *NestedImageStore) *specs.Spec {
+		spec := Build(parityOptions)
+		ShapeGVisor(spec, GVisorOptions{ActorUID: testActorUID, ActorDirs: parityActorDirs, ContainerName: containerName, NestedImageStore: nis, Size: paritySize})
+		return spec
+	}
+
+	hasMount := func(spec *specs.Spec) (specs.Mount, bool) {
+		for _, m := range spec.Mounts {
+			if m.Destination == store {
+				return m, true
+			}
+		}
+		return specs.Mount{}, false
+	}
+
+	t.Run("app container gets a capped tmpfs with the requested size", func(t *testing.T) {
+		m, ok := hasMount(shapeGVisor("app", &NestedImageStore{SizeBytes: 1 << 30}))
+		if !ok {
+			t.Fatalf("app container has no mount at %s", store)
+		}
+		if m.Type != "tmpfs" || m.Source != "tmpfs" {
+			t.Errorf("mount type/source = %q/%q, want tmpfs/tmpfs", m.Type, m.Source)
+		}
+		// nodev, like the system and volume mounts ShapeGVisor keeps.
+		want := []string{"nosuid", "nodev", "size=1073741824", "mode=0711"}
+		if !slices.Equal(m.Options, want) {
+			t.Errorf("mount options = %v, want %v", m.Options, want)
+		}
+	})
+
+	t.Run("system mounts are unchanged beside the image store", func(t *testing.T) {
+		// The image store is one extra mount at the end; the system mounts
+		// ShapeGVisor keeps (and the /tmp cap) are the same as without it.
+		without := shapeGVisor("app", nil)
+		with := shapeGVisor("app", &NestedImageStore{SizeBytes: 1 << 30})
+		if len(with.Mounts) != len(without.Mounts)+1 {
+			t.Fatalf("mount count = %d, want %d", len(with.Mounts), len(without.Mounts)+1)
+		}
+		if got := with.Mounts[:len(without.Mounts)]; !reflect.DeepEqual(got, without.Mounts) {
+			t.Errorf("other mounts =\n%+v\nwant\n%+v", got, without.Mounts)
+		}
+		if got := with.Mounts[len(with.Mounts)-1].Destination; got != store {
+			t.Errorf("last mount = %s, want %s", got, store)
+		}
+		if got := mountFor(t, with, "/tmp"); !slices.Contains(got.Options, "size="+itoa(paritySize.MemoryBytes/2)) {
+			t.Errorf("/tmp options = %v, want the half-memory cap", got.Options)
+		}
+	})
+
+	t.Run("zero size selects the default cap", func(t *testing.T) {
+		m, ok := hasMount(shapeGVisor("app", &NestedImageStore{SizeBytes: 0}))
+		if !ok {
+			t.Fatalf("app container has no mount at %s", store)
+		}
+		if !slices.Contains(m.Options, "size="+itoa(DefaultNestedImageStoreBytes)) {
+			t.Errorf("mount options %v do not carry the default cap", m.Options)
+		}
+	})
+
+	t.Run("sandbox root container never gets the mount even when requested", func(t *testing.T) {
+		if _, ok := hasMount(shapeGVisor(SandboxID, &NestedImageStore{SizeBytes: 1 << 30})); ok {
+			t.Errorf("sandbox root container got the nested image-store tmpfs")
+		}
+	})
+
+	t.Run("nil NestedImageStore adds no mount", func(t *testing.T) {
+		if _, ok := hasMount(shapeGVisor("app", nil)); ok {
+			t.Errorf("app container got the tmpfs with a nil NestedImageStore")
+		}
+	})
+
+	t.Run("idempotent: a second shaping does not duplicate the mount", func(t *testing.T) {
+		spec := Build(parityOptions)
+		o := GVisorOptions{ActorUID: testActorUID, ActorDirs: parityActorDirs, ContainerName: "app", NestedImageStore: &NestedImageStore{SizeBytes: 1 << 30}, Size: paritySize}
+		ShapeGVisor(spec, o)
+		first := slices.Clone(spec.Mounts)
+		ShapeGVisor(spec, o)
+		if !reflect.DeepEqual(spec.Mounts, first) {
+			t.Errorf("mounts after a second shaping =\n%+v\nwant\n%+v", spec.Mounts, first)
+		}
+	})
+
+	t.Run("microVM path is unaffected", func(t *testing.T) {
+		// ShapeMicroVM takes no NestedImageStore and must not add the tmpfs,
+		// so the microVM runtime and the parity test stay unchanged.
+		spec := Build(parityOptions)
+		if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
+			t.Fatalf("ShapeMicroVM() = %v", err)
+		}
+		if _, ok := hasMount(spec); ok {
+			t.Errorf("ShapeMicroVM added a mount at %s", store)
+		}
+	})
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }

@@ -41,6 +41,9 @@ type Gate string
 const (
 	// GateExternalVolumes controls whether external volumes are supported.
 	GateExternalVolumes Gate = "ExternalVolumes"
+	// GateNestedContainers controls whether an actor may opt into running a
+	// nested container stack inside its gVisor sandbox.
+	GateNestedContainers Gate = "NestedContainers"
 
 	// GateGoldenEgressPolicy controls configuring a golden actor's egress policy on its template.
 	GateGoldenEgressPolicy Gate = "GoldenEgressPolicy"
@@ -60,6 +63,7 @@ const All = "ALL"
 var realKnownGates = []Gate{
 	GateExternalVolumes,
 	GateGoldenEgressPolicy,
+	GateNestedContainers,
 	GatePerTemplateSnapshotLocation,
 }
 

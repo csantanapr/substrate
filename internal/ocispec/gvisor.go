@@ -31,6 +31,26 @@ import (
 // name is drawn from, so no actor container can collide with it.
 const SandboxID = "_sandbox"
 
+// gVisor writes resolv.conf into the rootfs, as microVM does, so ShapeGVisor
+// adds no resolv.conf bind mount. The nested image store below is independent
+// of DNS.
+const (
+	// NestedImageStorePath is where a nested container runtime keeps its image
+	// store (Docker's default data root). An actor container that opted into
+	// nested containers gets a size-capped tmpfs mounted here, so the inner
+	// runtime's layers live in RAM the sandbox can cap and the MEMORY checkpoint
+	// captures them with the rest of memory. Also used by admission to reject a
+	// user volume that would overlap this path.
+	NestedImageStorePath = "/var/lib/docker"
+
+	// DefaultNestedImageStoreBytes caps the nested image-store tmpfs when the
+	// template leaves image_store_size unset. The tmpfs is captured as memory
+	// in every MEMORY snapshot, so the default is kept modest (512 MiB). A
+	// template may raise or lower it within the admission bounds; see
+	// NestedContainersConfig.image_store_size.
+	DefaultNestedImageStoreBytes = 512 << 20
+)
+
 // GVisorOptions describes the gVisor-specific context of one actor container.
 type GVisorOptions struct {
 	ActorUID      string
@@ -42,6 +62,28 @@ type GVisorOptions struct {
 	// applies it; a microVM container's limits come from its own declared
 	// resources (see sizing).
 	Size sizing.SandboxSize
+	// NestedImageStore, when non-nil, adds a size-capped tmpfs at
+	// NestedImageStorePath for this container. Set for the application
+	// containers of an actor that opted into nested containers, never for the
+	// sandbox root container (it runs no nested runtime). A nil value (the default)
+	// adds no mount, so a container that did not opt in is shaped exactly as it
+	// would be without this option.
+	NestedImageStore *NestedImageStore
+}
+
+// NestedImageStore requests the size-capped tmpfs an opted-in actor container
+// needs at the nested image-store path.
+type NestedImageStore struct {
+	// SizeBytes caps the tmpfs. A value <= 0 selects DefaultNestedImageStoreBytes.
+	SizeBytes int64
+}
+
+// cap returns the effective tmpfs size in bytes, applying the default.
+func (n *NestedImageStore) cap() int64 {
+	if n.SizeBytes <= 0 {
+		return DefaultNestedImageStoreBytes
+	}
+	return n.SizeBytes
 }
 
 // GVisorCgroupLeaf names an actor container's cgroup relative to the pod scope.
@@ -70,6 +112,24 @@ func ShapeGVisor(spec *specs.Spec, o GVisorOptions) {
 	} else {
 		spec.Annotations["io.kubernetes.cri.container-type"] = "container"
 		spec.Annotations["io.kubernetes.cri.sandbox-id"] = SandboxID
+	}
+
+	// An opted-in actor's application containers get a size-capped tmpfs at the
+	// nested image store, so the inner runtime's layers live in RAM the sandbox
+	// can cap and the MEMORY checkpoint captures them. gVisor only: ShapeMicroVM
+	// adds nothing here, so the microVM path and the parity test are
+	// unaffected. Never on the sandbox root container (it runs no nested runtime), and
+	// idempotent so a second shaping does not accumulate the mount. Added before
+	// the mount clean-up below so it passes through the same option filter. It
+	// is nodev like every other mount ShapeGVisor keeps.
+	if o.NestedImageStore != nil && o.ContainerName != SandboxID &&
+		!slices.ContainsFunc(spec.Mounts, func(m specs.Mount) bool { return m.Destination == NestedImageStorePath }) {
+		spec.Mounts = append(spec.Mounts, specs.Mount{
+			Destination: NestedImageStorePath,
+			Type:        "tmpfs",
+			Source:      "tmpfs",
+			Options:     []string{"nosuid", "nodev", fmt.Sprintf("size=%d", o.NestedImageStore.cap()), "mode=0711"},
+		})
 	}
 
 	// runsc replaces /dev and /dev/pts with its own mounts and ignores mqueue

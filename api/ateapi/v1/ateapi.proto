@@ -1214,6 +1214,62 @@ message ActorTemplate {
 
   // +k8s:optional
   ActorTemplateStatus status = 7;
+
+  // runtime carries optional per-actor runtime configuration. Unset leaves
+  // every runtime default unchanged, so a template that omits it behaves
+  // exactly as it did before this field existed.
+  //
+  // +k8s:optional
+  RuntimeConfig runtime = 8;
+}
+
+// RuntimeConfig holds optional adjustments to how an actor's sandbox runtime
+// runs the actor. Every field is opt-in; an unset RuntimeConfig, or an unset
+// field within it, leaves the corresponding runtime default unchanged.
+message RuntimeConfig {
+  // nested_containers opts the actor into running a nested container stack
+  // (an inner process that itself runs a container runtime and child
+  // containers) inside its gVisor sandbox. Unset leaves it off.
+  //
+  // +ate:preview=NestedContainers
+  // +k8s:ifDisabled(NestedContainers)=+k8s:forbidden
+  // +k8s:optional
+  NestedContainersConfig nested_containers = 1;
+}
+
+// NestedContainersConfig opts an actor into nested containers inside its
+// gVisor sandbox. It is validated at admission: packet_socket_write and
+// image_store_size require enabled.
+//
+// +k8s:customValidation # packet_socket_write and image_store_size require enabled; image_store_size must be whole bytes in [64Mi, 64Gi]
+message NestedContainersConfig {
+  // enabled turns on nested-container support for the actor's sandbox. When
+  // true, the gVisor worker adds runsc -net-raw to every sandbox invocation
+  // and mounts a size-capped tmpfs at the nested image-store path. Default
+  // false.
+  //
+  // +k8s:optional
+  bool enabled = 1;
+
+  // packet_socket_write additionally grants in-sandbox packet-socket write
+  // (runsc -allow-packet-socket-write), which Docker v28+ needs inside gVisor.
+  // Docker v27 does not. Requires enabled. Default false, so the extra network
+  // capability is never granted unless the template asks for it.
+  //
+  // +k8s:optional
+  bool packet_socket_write = 2;
+
+  // image_store_size caps the tmpfs mounted at the nested image-store path
+  // (/var/lib/docker). Its contents are captured as process memory, so it is
+  // packaged in any MEMORY-fidelity snapshot and the cap bounds snapshot
+  // size. A Kubernetes resource.Quantity string (e.g. "512Mi") naming a whole
+  // number of bytes between 64Mi and 64Gi inclusive; anything else is rejected
+  // at admission. Empty selects the documented default of 512Mi. Requires
+  // enabled.
+  //
+  // +k8s:optional
+  // +k8s:maxLength=32 # the customValidation requires a whole-byte quantity in [64Mi, 64Gi]
+  string image_store_size = 3;
 }
 
 // ResourceRequirements are the compute resources a workload may use.
