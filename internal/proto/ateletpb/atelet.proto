@@ -628,6 +628,41 @@ message WorkloadSpec {
   // +k8s:listType=map
   // +k8s:listMapKey=name
   repeated Volume volumes = 2;
+
+  // nested_containers, when set with enabled=true, opts the actor into
+  // running a nested container stack inside its gVisor sandbox. ate-api-server
+  // sets it from the ActorTemplate's runtime.nested_containers; atelet
+  // forwards it to ateworker-gvisor. Absent/disabled leaves the sandbox
+  // unchanged, so a default actor's worker-side spec is exactly what it was
+  // before this field existed.
+  //
+  // +k8s:optional
+  NestedContainers nested_containers = 3;
+}
+
+// NestedContainers is the worker-side projection of the ActorTemplate's
+// runtime.nested_containers opt-in. The image_store_size resource.Quantity is
+// already parsed to bytes by ate-api-server (toAteletNestedContainers) so each
+// quantity is parsed exactly once.
+message NestedContainers {
+  // enabled turns on nested-container support: ateworker-gvisor adds runsc
+  // -net-raw on every sandbox invocation plus a size-capped tmpfs at the
+  // nested image-store path.
+  //
+  // +k8s:optional
+  bool enabled = 1;
+
+  // packet_socket_write adds runsc -allow-packet-socket-write (Docker v28+
+  // needs it inside gVisor). Requires enabled (enforced at admission).
+  //
+  // +k8s:optional
+  bool packet_socket_write = 2;
+
+  // image_store_size_bytes caps the nested image-store tmpfs. 0 means the
+  // worker's documented default (512Mi).
+  //
+  // +k8s:optional
+  int64 image_store_size_bytes = 3;
 }
 
 message DurableDirVolumeSource {

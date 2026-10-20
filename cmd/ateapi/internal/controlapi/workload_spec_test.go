@@ -615,3 +615,46 @@ func TestWorkloadSpecFromActorTemplatePropagatesResources(t *testing.T) {
 		t.Errorf("unlimited container Resources = %v, want nil", r)
 	}
 }
+
+// TestWorkloadSpecFromActorTemplateNestedContainers pins the ateapi forwarding hop both
+// ways: no runtime, an empty runtime and a disabled opt-in all project a nil
+// NestedContainers (default actor unchanged); an enabled opt-in projects the
+// flags with the image_store_size quantity parsed to bytes exactly once.
+func TestWorkloadSpecFromActorTemplateNestedContainers(t *testing.T) {
+	base := func(runtime *ateapi.RuntimeConfig) *ateapi.ActorTemplate {
+		return &ateapi.ActorTemplate{
+			Metadata:   &ateapi.ResourceMetadata{Atespace: "ns1", Name: "tmpl-a"},
+			Containers: []*ateapi.Container{{Name: "main", Image: "main"}},
+			Runtime:    runtime,
+		}
+	}
+	for _, tt := range []struct {
+		name string
+		tmpl *ateapi.ActorTemplate
+		want *ateletpb.NestedContainers
+	}{
+		{"no runtime", base(nil), nil},
+		{"empty runtime", base(&ateapi.RuntimeConfig{}), nil},
+		{"disabled", base(&ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: false, PacketSocketWrite: true}}), nil},
+		{
+			"enabled, no size (default at the worker)",
+			base(&ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true}}),
+			&ateletpb.NestedContainers{Enabled: true},
+		},
+		{
+			"enabled with write and 1Gi",
+			base(&ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true, PacketSocketWrite: true, ImageStoreSize: "1Gi"}}),
+			&ateletpb.NestedContainers{Enabled: true, PacketSocketWrite: true, ImageStoreSizeBytes: 1 << 30},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := workloadSpecFromActorTemplate(tt.tmpl, nil, nil)
+			if err != nil {
+				t.Fatalf("workloadSpecFromActorTemplate = %v", err)
+			}
+			if diff := cmp.Diff(tt.want, got.GetNestedContainers(), protocmp.Transform()); diff != "" {
+				t.Errorf("NestedContainers mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

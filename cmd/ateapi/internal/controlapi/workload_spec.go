@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 )
 
@@ -32,10 +33,42 @@ func toAteletResources(r *ateapi.ResourceRequirements) *ateletpb.ResourceRequire
 	return &ateletpb.ResourceRequirements{Limits: &ateletpb.Resources{CpuMillicores: l.GetCpuMillicores(), MemoryBytes: l.GetMemoryBytes()}}
 }
 
+// toAteletNestedContainers projects the template's nested-containers opt-in
+// onto the worker-side spec, parsing the image-store quantity to bytes once
+// here (as toAteletResources does for the container limits), through the same
+// apivalidation.NestedImageStoreBytes rule admission uses. Returns nil when the
+// opt-in is absent or disabled, so a default actor's spec carries no nested
+// config and the worker path stays byte-for-byte unchanged. Admission has
+// already rejected packet_socket_write or image_store_size without enabled, and
+// an out-of-bounds size, so a parse error here is defensive.
+func toAteletNestedContainers(in *ateapi.NestedContainersConfig) (*ateletpb.NestedContainers, error) {
+	if in == nil || !in.GetEnabled() {
+		return nil, nil
+	}
+	out := &ateletpb.NestedContainers{
+		Enabled:           true,
+		PacketSocketWrite: in.GetPacketSocketWrite(),
+	}
+	if s := in.GetImageStoreSize(); s != "" {
+		bytes, err := apivalidation.NestedImageStoreBytes(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid nested image_store_size %q: %w", s, err)
+		}
+		out.ImageStoreSizeBytes = bytes
+	}
+	return out, nil
+}
+
 // workloadSpecFromActorTemplate builds a WorkloadSpec from the template;
 // container env is copied verbatim.
 func workloadSpecFromActorTemplate(actorTemplate *ateapi.ActorTemplate, actor *ateapi.Actor, volumePublishContexts map[string]map[string]string) (*ateletpb.WorkloadSpec, error) {
 	workloadSpec := &ateletpb.WorkloadSpec{}
+
+	nested, err := toAteletNestedContainers(actorTemplate.GetRuntime().GetNestedContainers())
+	if err != nil {
+		return nil, err
+	}
+	workloadSpec.NestedContainers = nested
 
 	// Convert volumes to atelet's representation.  ActorTemplate validation has
 	// already ensured that only one source is set.
