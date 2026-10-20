@@ -372,7 +372,16 @@ A container running as root has that set as its effective capabilities. A contai
       add: ["NET_BIND_SERVICE"]
   ```
 
-- **Allowed capabilities.** `add` accepts only `AUDIT_WRITE`, `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID` and `SYS_CHROOT`. Any other name, including `ALL`, `DAC_READ_SEARCH`, `MKNOD`, `NET_RAW`, `SYS_ADMIN` and `SYS_PTRACE`, is rejected at admission. These capabilities act on the microVM guest kernel and its devices, not just on the container. `drop` accepts any capability name.
+- **Allowed capabilities.** `add` accepts only `AUDIT_WRITE`, `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `SETFCAP`, `SETGID`, `SETPCAP`, `SETUID` and `SYS_CHROOT`. Any other name, including `ALL`, `DAC_READ_SEARCH`, `NET_RAW` and `SYS_PTRACE`, is rejected at admission, and so are `MKNOD`, `NET_ADMIN` and `SYS_ADMIN` unless the template opts into nested containers (below). These capabilities act on the microVM guest kernel and its devices, not just on the container. `drop` accepts any capability name.
+- **Nested containers.** A template with `runtime.nestedContainers.enabled` (gVisor only) may also add `MKNOD`, `NET_ADMIN` and `SYS_ADMIN`. Every other name is rejected as above, and without the opt-in these three are rejected with an error that names `runtime.nested_containers.enabled`. They are held inside the gVisor sandbox only, never on the host. Docker 27.5.1 with runc 1.2.4 inside a gVisor sandbox was measured to need this `add` list, with the default set left in place (do not drop `AUDIT_WRITE`, `KILL` or `NET_BIND_SERVICE`):
+
+  ```yaml
+  securityContext:
+    capabilities:
+      add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT", "MKNOD", "NET_ADMIN", "SYS_ADMIN"]
+  ```
+
+  In that measurement, in a standalone gVisor sandbox, Docker starts, runs and builds containers with this list, and fails when any one of the resulting 15 capabilities is missing; `NET_RAW` and `SYS_PTRACE` were not needed. It is not a general requirement of container engines: other engines and versions, admission on a cluster, and sets that drop default capabilities were not measured.
 - **Ambient capabilities are not supported** ([gvisor#3166](https://github.com/google/gvisor/issues/3166)).
 - **Low ports.** A container may bind a port below 1024 without `NET_BIND_SERVICE` on both runtimes: gVisor's network stack has no privileged-port limit, and the microVM guest sets `net.ipv4.ip_unprivileged_port_start=0` to match.
 - **`ping` without `NET_RAW`.** `NET_RAW` can't be added. Both runtimes let any user open ICMP echo sockets, which is what `ping` uses: gVisor's network stack allows them, and the microVM guest sets `net.ipv4.ping_group_range=0 2147483647` to match.

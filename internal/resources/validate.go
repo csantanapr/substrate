@@ -428,8 +428,33 @@ var AllowedAddCapabilities = sets.New(
 	"NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
 )
 
+// NestedContainersAddCapabilities are the capabilities a container may add on
+// top of AllowedAddCapabilities, and only when its workload opts into nested
+// containers. They were measured to be needed by Docker 27.5.1 with runc 1.2.4
+// inside a gVisor sandbox: SYS_ADMIN to mount its cgroups and overlay
+// filesystems, MKNOD because Docker grants it to its own containers by default,
+// and NET_ADMIN to set up their network namespaces. Nested containers are
+// gVisor-only, so these are held inside the gVisor sandbox, never on the host.
+var NestedContainersAddCapabilities = sets.New("MKNOD", "NET_ADMIN", "SYS_ADMIN")
+
 // ValidateAddCapabilities accepts only AllowedAddCapabilities.
 func ValidateAddCapabilities(fldPath *field.Path, caps []string) field.ErrorList {
+	return validateAddCapabilities(fldPath, caps, AllowedAddCapabilities)
+}
+
+// ValidateAddCapabilitiesAllowingNested accepts AllowedAddCapabilities and
+// NestedContainersAddCapabilities. It sees one field, not the nested-containers
+// opt-in, so it may only validate a field whose enclosing object also runs
+// ValidateNestedContainersAddCapabilities; otherwise use ValidateAddCapabilities.
+// Every other name gets the same error as from ValidateAddCapabilities.
+func ValidateAddCapabilitiesAllowingNested(fldPath *field.Path, caps []string) field.ErrorList {
+	return validateAddCapabilities(fldPath, caps, AllowedAddCapabilities.Union(NestedContainersAddCapabilities))
+}
+
+// validateAddCapabilities accepts the names in allowed. Its errors list only
+// AllowedAddCapabilities: the nested-only names are not offered to a workload
+// that may not use them.
+func validateAddCapabilities(fldPath *field.Path, caps []string, allowed sets.Set[string]) field.ErrorList {
 	var errs field.ErrorList
 	for i, c := range caps {
 		p := fldPath.Index(i)
@@ -441,8 +466,25 @@ func ValidateAddCapabilities(fldPath *field.Path, caps []string) field.ErrorList
 			errs = append(errs, err)
 			continue
 		}
-		if !AllowedAddCapabilities.Has(c) {
+		if !allowed.Has(c) {
 			errs = append(errs, field.NotSupported(p, c, sets.List(AllowedAddCapabilities)))
+		}
+	}
+	return errs
+}
+
+// ValidateNestedContainersAddCapabilities forbids every
+// NestedContainersAddCapabilities name in add unless nestedEnabled is true.
+// optIn names the opt-in field in the error. It is the cross-field half of
+// ValidateAddCapabilitiesAllowingNested and checks nothing else.
+func ValidateNestedContainersAddCapabilities(fldPath *field.Path, add []string, nestedEnabled bool, optIn string) field.ErrorList {
+	if nestedEnabled {
+		return nil
+	}
+	var errs field.ErrorList
+	for i, c := range add {
+		if NestedContainersAddCapabilities.Has(c) {
+			errs = append(errs, field.Forbidden(fldPath.Index(i), fmt.Sprintf("%s may only be added when %s is true", c, optIn)))
 		}
 	}
 	return errs

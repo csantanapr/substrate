@@ -17,13 +17,18 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"maps"
+	"slices"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/cmd/atelet/internal/apivalidation"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/sandboxruntimes"
 	"go.ate.dev/substrate/internal/substratex509"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -35,6 +40,13 @@ type workerSupportServer struct {
 	ateletpb.UnimplementedWorkerSupportServer
 	workers ateapi.WorkerServiceClient
 	control ateapi.ControlClient
+	// runtimesPath returns the sandbox runtimes file path for a worker pod UID.
+	// It is set only on the network-worker listener, where the
+	// GetSandboxRuntimes RPC serves a worker that cannot read the shared file
+	// itself. It is nil on the default Unix-socket listener, where colocated
+	// workers read the file directly, so GetSandboxRuntimes is unavailable
+	// there -- a colocated worker never calls it.
+	runtimesPath func(podUID string) string
 }
 
 func (b *workerSupportServer) MintActorCertificate(ctx context.Context, req *ateletpb.MintActorCertificateRequest) (*ateletpb.MintActorCertificateResponse, error) {
@@ -345,6 +357,64 @@ func (s *workerSupportServer) GetActorEgressPolicy(
 		slog.String("actor_name", req.GetActorName()))
 
 	return &ateletpb.GetActorEgressPolicyResponse{EgressPolicy: toAteletEgressPolicy(policy)}, nil
+}
+
+// GetSandboxRuntimes returns the sandbox runtimes atelet keeps for the calling
+// worker, read from the same on-node file the syncer writes. Colocated workers
+// read that file directly, so this is wired only on the network-worker
+// listener; on any other listener runtimesPath is nil and this fails closed
+// with Unimplemented. The worker is identified only by its mTLS certificate,
+// never by the request, so it gets its own pool's runtimes and no other's.
+//
+// An absent or not-yet-written file is reported as an empty default runtime,
+// not an error: the worker reconciler treats that exactly as it treats an
+// absent file (wait and retry), so a worker that comes up before atelet has
+// resolved its pool's SandboxConfig does not fail -- it registers once the
+// runtimes exist.
+func (s *workerSupportServer) GetSandboxRuntimes(ctx context.Context, _ *ateletpb.GetSandboxRuntimesRequest) (*ateletpb.GetSandboxRuntimesResponse, error) {
+	if s.runtimesPath == nil {
+		return nil, status.Error(codes.Unimplemented, "sandbox runtimes are read from the shared file by colocated workers")
+	}
+	workerIdentity, err := authenticatedWorkerIdentity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	file, err := sandboxruntimes.Read(s.runtimesPath(workerIdentity.PodUID))
+	if errors.Is(err, fs.ErrNotExist) {
+		// Not written yet. The worker waits and retries, as it would an absent
+		// file; returning an empty default runtime (rather than an error) keeps
+		// that path identical to the colocated one.
+		return &ateletpb.GetSandboxRuntimesResponse{}, nil
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read sandbox runtimes: %v", err)
+	}
+	resp := &ateletpb.GetSandboxRuntimesResponse{}
+	for _, class := range file.SandboxClasses {
+		c := &ateletpb.SandboxRuntimesClass{
+			SandboxClass:   class.SandboxClass,
+			DefaultRuntime: sandboxRuntimeAttributes(class.DefaultRuntime.Version),
+		}
+		for _, rt := range class.RestorableRuntimes {
+			c.RestorableRuntimes = append(c.RestorableRuntimes, sandboxRuntimeAttributes(rt.Version))
+		}
+		resp.SandboxClasses = append(resp.SandboxClasses, c)
+	}
+	slog.DebugContext(ctx, "Served sandbox runtimes to a network worker",
+		slog.String("pod_uid", workerIdentity.PodUID),
+		slog.Int("sandbox_classes", len(resp.GetSandboxClasses())))
+	return resp, nil
+}
+
+// sandboxRuntimeAttributes converts the file's attribute map to the wire type,
+// sorted by key so the response is deterministic. A nil or empty map yields a
+// runtime with no attributes, which the worker reads as "not present yet".
+func sandboxRuntimeAttributes(attrs sandboxruntimes.Attributes) *ateletpb.SandboxRuntimeAttributes {
+	out := &ateletpb.SandboxRuntimeAttributes{}
+	for _, k := range slices.Sorted(maps.Keys(attrs)) {
+		out.Attributes = append(out.Attributes, &ateletpb.AttributeEntry{Key: k, Value: attrs[k]})
+	}
+	return out
 }
 
 // ReportActorCrashed forwards a worker's report that the sandbox of an actor

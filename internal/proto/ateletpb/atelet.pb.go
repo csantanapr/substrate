@@ -2444,7 +2444,7 @@ func (x *EgressGateway) GetAddress() string {
 
 // WorkloadSpec parallels Pod, but with far fewer configurable fields.
 //
-// +k8s:customValidation # every volume mount names a declared volume
+// +k8s:customValidation # every volume mount names a declared volume; nested-only capabilities require nested_containers.enabled
 type WorkloadSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// +k8s:optional
@@ -3405,10 +3405,14 @@ func (x *SecurityContext) GetCapabilities() *Capabilities {
 // set. Names carry no "CAP_" prefix; drop applies before add.
 type Capabilities struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
+	// add may also name MKNOD, NET_ADMIN and SYS_ADMIN when the spec sets
+	// nested_containers.enabled. This field's own check accepts those three
+	// names; the check on the enclosing WorkloadSpec enforces the opt-in.
+	//
 	// +k8s:optional
 	// +k8s:maxItems=64
 	// +k8s:listType=set
-	// +k8s:customValidation # one of resources.AllowedAddCapabilities
+	// +k8s:customValidation # one of resources.AllowedAddCapabilities, or also resources.NestedContainersAddCapabilities with nested_containers.enabled
 	Add []string `protobuf:"bytes,1,rep,name=add,proto3" json:"add,omitempty"`
 	// +k8s:optional
 	// +k8s:maxItems=64

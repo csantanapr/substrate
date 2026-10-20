@@ -114,8 +114,20 @@ spec:
       port: postgres
 ---
 # atelet's gRPC port is called only by ate-api-server, which dials the atelet
-# pod IP. Worker pods talk to atelet over its node-local Unix socket, not this
-# port. The hostPort mapping lands on the pod, so this policy covers it too.
+# pod IP. A colocated worker talks to atelet over its node-local Unix socket,
+# not this port. The hostPort mapping lands on the pod, so this policy covers
+# it too.
+#
+# The worker-svcs port is the exception: the workers of a networkTransport pool
+# run in their own guest Pod and reach atelet through the atelet-workers
+# Service. They live in their pool's namespace, so the rule admits the
+# ate.dev/worker-transport=network label from any namespace. The controller
+# sets that label on a network pool's workers, and a WorkerPool template cannot
+# set it, but nothing stops another Pod from carrying it. So this rule only
+# narrows who can connect. mTLS and atelet's node-local inventory authorize
+# the worker: its Pod certificate must name a running Pod on atelet's node that
+# runs as the worker service account and carries the worker labels, and
+# registering also needs the Worker record the control plane keeps for it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -135,6 +147,14 @@ spec:
     ports:
     - protocol: TCP
       port: grpc
+  - from:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          ate.dev/worker-transport: network
+    ports:
+    - protocol: TCP
+      port: worker-svcs
 ---
 # The router's data ports carry every request to an actor, from pods in any
 # namespace and from load balancers and Gateways outside the cluster, so they

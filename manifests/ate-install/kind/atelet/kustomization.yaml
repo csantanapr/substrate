@@ -34,6 +34,11 @@ patches:
               - --localhost-registry-replacement=kind-registry:5000
               - --grpc-server-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
               - --client-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
+              # This list replaces the base manifest's, so the networked
+              # WorkerSupport listener has to be repeated here. It serves the
+              # workers of a networkTransport pool through the atelet-workers
+              # Service in ../../atelet.yaml.
+              - --network-workers
               # Kind clusters are dev/CI: run atelet at debug so e2e suites can
               # assert on per-item log lines. Production installs default to info.
               - --log-level=debug

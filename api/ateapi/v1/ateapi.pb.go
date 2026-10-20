@@ -2760,6 +2760,10 @@ func (x *ObjectRef) GetName() string {
 	return ""
 }
 
+// An actor template: the containers, volumes and snapshot policy its actors
+// share.
+//
+// +k8s:customValidation # nested-only capabilities require runtime.nested_containers.enabled
 type ActorTemplate struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Common resource metadata: atespace, name, uid, version, timestamps.
@@ -3644,12 +3648,16 @@ type Capabilities struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// add lists capabilities to grant on top of the default set. Only
 	// AUDIT_WRITE, CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE,
-	// SETFCAP, SETGID, SETPCAP, SETUID and SYS_CHROOT are accepted.
+	// SETFCAP, SETGID, SETPCAP, SETUID and SYS_CHROOT are accepted. A template
+	// with runtime.nested_containers.enabled may also add MKNOD, NET_ADMIN and
+	// SYS_ADMIN (measured to be needed by Docker 27.5.1 with runc 1.2.4 inside
+	// a gVisor sandbox). This field's own check accepts those three names; the
+	// check on the enclosing ActorTemplate enforces the opt-in.
 	//
 	// +k8s:optional
 	// +k8s:maxItems=64
 	// +k8s:listType=set
-	// +k8s:customValidation # one of resources.AllowedAddCapabilities
+	// +k8s:customValidation # one of resources.AllowedAddCapabilities, or also resources.NestedContainersAddCapabilities with runtime.nested_containers.enabled
 	Add []string `protobuf:"bytes,1,rep,name=add,proto3" json:"add,omitempty"`
 	// drop lists capabilities to remove from the default set. "ALL" drops the
 	// whole set, so drop+add expresses an exact set rather than a relative one.

@@ -1149,6 +1149,11 @@ func Validate_ActorTemplate(
 	ctx context.Context, op operation.Operation, fldPath *field.Path,
 	obj, oldObj *v1.ActorTemplate) (errs field.ErrorList) {
 
+	// custom validation
+	if e := ValidateCustom_ActorTemplate(ctx, op, fldPath, obj, oldObj); len(e) != 0 {
+		errs = append(errs, e...)
+	}
+
 	{ // field v1.ActorTemplate.Metadata
 		fn := func(
 			fldPath *field.Path,

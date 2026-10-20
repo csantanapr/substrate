@@ -658,3 +658,43 @@ func TestWorkloadSpecFromActorTemplateNestedContainers(t *testing.T) {
 		})
 	}
 }
+
+// TestWorkloadSpecFromActorTemplateNestedCapabilities pins that the forwarding
+// hop carries the nested-containers opt-in and capabilities.add together, so
+// atelet's WorkloadSpec check decides on the same opt-in admission did: an
+// opted-in template forwards enabled and its add list unchanged; a template
+// without the opt-in forwards no NestedContainers, so atelet refuses a
+// nested-only capability it carries.
+func TestWorkloadSpecFromActorTemplateNestedCapabilities(t *testing.T) {
+	add := []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT", "MKNOD", "NET_ADMIN", "SYS_ADMIN"}
+	tmpl := func(runtime *ateapi.RuntimeConfig) *ateapi.ActorTemplate {
+		return &ateapi.ActorTemplate{
+			Metadata: &ateapi.ResourceMetadata{Atespace: "ns1", Name: "tmpl-a"},
+			Containers: []*ateapi.Container{{Name: "main", Image: "main",
+				SecurityContext: &ateapi.SecurityContext{Capabilities: &ateapi.Capabilities{Add: add}}}},
+			Runtime: runtime,
+		}
+	}
+	for _, tt := range []struct {
+		name string
+		tmpl *ateapi.ActorTemplate
+		want *ateletpb.NestedContainers
+	}{
+		{"opted in", tmpl(&ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true}}), &ateletpb.NestedContainers{Enabled: true}},
+		{"not opted in", tmpl(nil), nil},
+		{"disabled", tmpl(&ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{}}), nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := workloadSpecFromActorTemplate(tt.tmpl, nil, nil)
+			if err != nil {
+				t.Fatalf("workloadSpecFromActorTemplate = %v", err)
+			}
+			if diff := cmp.Diff(tt.want, got.GetNestedContainers(), protocmp.Transform()); diff != "" {
+				t.Errorf("NestedContainers mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(add, got.GetContainers()[0].GetSecurityContext().GetCapabilities().GetAdd()); diff != "" {
+				t.Errorf("capabilities.add mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

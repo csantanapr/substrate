@@ -70,6 +70,7 @@ import (
 	"go.ate.dev/substrate/internal/version"
 	"go.ate.dev/substrate/internal/volume"
 	"go.ate.dev/substrate/internal/volume/csi"
+	"go.ate.dev/substrate/internal/workertransport"
 	"go.ate.dev/substrate/pkg/client/clientset/versioned"
 	"go.ate.dev/substrate/pkg/client/informers/externalversions"
 	"go.ate.dev/substrate/pkg/objectstorage"
@@ -470,8 +471,26 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to load atelet Pod identity", fmt.Errorf("credential bundle has no Pod identity"))
 	}
 
+	// network mode: build the node-scoped network-worker inventory and mTLS dialer
+	// ONCE, so the same object authorizes inbound WorkerSupport handshakes (the
+	// listener below) and dials/stages/pulls as a client (workerDialer and the
+	// Atelet staging path). newNodeWorkerNetwork returns nil when
+	// --network-workers is unset, so with the flag off nothing changes: the
+	// dialer keeps its Unix-socket path and the Atelet takes no network path.
+	workerNet, err := newNodeWorkerNetwork(ctx, k8sClient, ateletIdentity)
+	if err != nil {
+		serverboot.Fatal(ctx, "Failed to set up network worker transport", err)
+	}
+	if workerNet != nil {
+		workerDialer.network = workerNet
+		if err := wmService.enableNetworkWorkers(workerNet); err != nil {
+			serverboot.Fatal(ctx, "Failed to enable network worker staging", err)
+		}
+	}
+
 	// SandboxConfigs and WorkerPools feed the workerSandboxSyncer: the pools
-	// tell it which SandboxConfig each local worker uses.
+	// tell it which SandboxConfig each local worker uses. SandboxConfigs also
+	// feed the asset prewarmer.
 	//
 	// Startup does not wait on these factories: the runtime index was loaded
 	// from disk above, so the workers already on this node resolve at once,
@@ -548,6 +567,50 @@ func main() {
 			serverboot.Fatal(ctx, "Failed to serve credential broker", err)
 		}
 	}()
+
+	// network mode: when --network-workers is set, ALSO serve WorkerSupport to
+	// workers that run in a separate guest Pod and cannot reach the Unix
+	// socket above. The Unix block is unchanged; this is a parallel listener
+	// whose authorization is the workertransport PeerPolicy (mTLS chain +
+	// same-node-incarnation + live Kubernetes worker inventory) plus a per-RPC
+	// authorizer that re-checks the inventory and admits only WorkerSupport
+	// methods. There is no plaintext or Unix fallback on this path, and a nil
+	// authorizer fails closed. With the flag unset newNodeWorkerNetwork returns
+	// nil and nothing below runs, so the default serving topology is unchanged.
+	if workerNet != nil {
+		workerNetTLS, err := workertransport.ServerTLS(*grpcServerCredBundle, *clientCACerts, workerNet.peerPolicy())
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to build network worker TLS config", err)
+		}
+		workerNetLis, err := net.Listen("tcp", *workerServicesAddress)
+		if err != nil {
+			serverboot.Fatal(ctx, "Failed to listen for networked worker support", err)
+		}
+		defer workerNetLis.Close()
+		workerNetSrv := grpc.NewServer(
+			grpc.Creds(workertransport.RefreshingCredentials(workerNetTLS)),
+			grpc.MaxRecvMsgSize(16<<20),
+			grpc.UnaryInterceptor(workertransport.UnaryAuthorizer(workerNet.authorizeWorker)),
+			grpc.StreamInterceptor(workertransport.StreamAuthorizer(workerNet.authorizeWorker)),
+		)
+		ateletpb.RegisterWorkerSupportServer(workerNetSrv, &workerSupportServer{
+			workers: ateapi.NewWorkerServiceClient(ateapiConn),
+			control: ateapi.NewControlClient(ateapiConn),
+			// network mode: a network worker cannot read its sandbox runtimes file
+			// off the shared filesystem, so it fetches them over
+			// GetSandboxRuntimes. The Unix listener above leaves this nil, so a
+			// colocated worker (which reads the file directly) gets
+			// Unimplemented and never depends on it.
+			runtimesPath: nodepath.WorkerSandboxRuntimesPath,
+		})
+		defer workerNetSrv.Stop()
+		slog.InfoContext(ctx, "Networked WorkerSupport listening", slog.String("address", *workerServicesAddress))
+		go func() {
+			if err := workerNetSrv.Serve(workerNetLis); err != nil {
+				serverboot.Fatal(ctx, "Failed to serve networked worker support", err)
+			}
+		}()
+	}
 
 	// Workers already registered with the control plane may be sent actors
 	// the moment atelet is reachable; the runtime index loaded above is what
@@ -771,6 +834,19 @@ type Atelet struct {
 	bootID string
 	// checkpointTimeout is defaultCheckpointTimeout. Shortened in tests.
 	checkpointTimeout time.Duration
+
+	// network and generations are nil by default (colocated workers). When
+	// --network-workers is set, enableNetworkWorkers wires them so the staging
+	// path (push assets in, pull a checkpoint out, persist the generation)
+	// engages for workers that run in a separate guest Pod. Set once at
+	// startup before any RPC can reach the Atelet, so they need no lock.
+	network     *nodeWorkerNetwork
+	generations *networkGenerations
+	// staging opens the staging client of a worker Pod, and nodeBase is the
+	// node-side root the staging client reads assets from and writes pulled
+	// checkpoints under. NewService sets both; only the network-worker path uses them.
+	staging  stagingConnector
+	nodeBase string
 }
 
 // defaultCheckpointTimeout bounds a Checkpoint once it detaches from the
@@ -828,6 +904,8 @@ func NewService(
 		workerActorJWTs:       newWorkerActorJWTs(workers),
 		bootID:                bootID,
 		checkpointTimeout:     defaultCheckpointTimeout,
+		staging:               workerDialer,
+		nodeBase:              nodepath.BasePath,
 	}
 	return wms
 }
@@ -835,6 +913,9 @@ func NewService(
 func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *ateletpb.RunResponse, err error) {
 	if errs := apivalidation.ValidateRunRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
+	}
+	if err := s.validateNetworkSpec(req.GetSpec()); err != nil {
+		return nil, err
 	}
 
 	actorUID := req.GetActorUid()
@@ -852,6 +933,16 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 		return nil, err
 	}
 	defer unlockActor()
+	if err := s.validateNetworkSandbox(sandboxRec.SandboxClass); err != nil {
+		return nil, err
+	}
+	// A nested-containers opt-in is honored only by ateworker-gvisor. The
+	// ActorTemplate carries no sandbox class, so the check runs here, where the
+	// resolved class is known, before any on-node work. Refusing keeps a microVM placement from silently
+	// dropping the opt-in and letting the template lie about the sandbox.
+	if err := validateNestedSandbox(req.GetSpec().GetNestedContainers(), sandboxRec.SandboxClass); err != nil {
+		return nil, err
+	}
 	endStart, err := s.snapshots.BeginStart(ctx, actorUID)
 	if err != nil {
 		return nil, err
@@ -894,12 +985,18 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 
 	// Record the sandbox binaries this actor is running so a later Checkpoint
 	// (whose request no longer carries the sandbox config) can re-fetch the same
-	// version and pin it into the snapshot manifest.
+	// version and pin it into the snapshot manifest. The nested-container flags
+	// the sandbox is created with are recorded alongside, for the same reason:
+	// the on-node record is the source of truth for what runsc is running.
 	if err := commitSandboxAssets(actorUID, staging, assetPaths); err != nil {
 		return nil, err
 	}
 	committed = true
-	if err := writeSandboxRecord(actorUID, sandboxRec); err != nil {
+	// sandboxRec is the node's shared index entry for this runtime, used by every
+	// Run that selects it, so set the per-actor flags on a copy.
+	nodeRec := *sandboxRec
+	nodeRec.NestedContainers = nestedContainersManifestFromSpec(req.GetSpec().GetNestedContainers())
+	if err := writeSandboxRecord(actorUID, &nodeRec); err != nil {
 		return nil, fmt.Errorf("while recording sandbox assets: %w", err)
 	}
 
@@ -920,6 +1017,15 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 	client, err := s.dialWorker(ctx, req.GetWorkerPodUid())
 	if err != nil {
 		return nil, err
+	}
+
+	// For a network worker, push the image layers, runtime assets and actor
+	// state (the OCI bundles prepared above) into the fresh guest BEFORE the
+	// worker RPC, so the worker finds everything on its own filesystem. FAIL
+	// CLOSED: if staging fails the worker RunWorkload below is not called.
+	// Colocated: no-op (the worker reads the node's shared filesystem).
+	if _, err := s.stageNetworkActivation(ctx, actorRef, actorUID, req.GetWorkerPodUid(), assetPaths); err != nil {
+		return nil, fmt.Errorf("while staging network activation: %w", err)
 	}
 
 	spec, err := buildWorkerWorkloadSpec(req.GetSpec(), containerSpecs)
@@ -1096,6 +1202,15 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 
 	checkpointDir := ateletpath.CheckpointStateDir(actorUID)
 
+	// For a network worker, resolve the activation (the persisted generation for
+	// this actor/worker) up front, so a missing or mismatched record fails the
+	// checkpoint before the guest is asked to do any work. Colocated: nil, and
+	// every network step below is a no-op.
+	activation, err := s.networkActivation(actorRef, actorUID, req.GetWorkerPodUid())
+	if err != nil {
+		return nil, err
+	}
+
 	client, err := s.dialWorker(opCtx, req.GetWorkerPodUid())
 	if err != nil {
 		return nil, err
@@ -1143,8 +1258,43 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	sandboxRec.ActorTemplateAtespace = req.GetActorTemplateAtespace()
 	sandboxRec.ActorTemplateName = req.GetActorTemplateName()
 	sandboxRec.Fidelity = ateattr.SnapshotFidelityValue(req.GetSnapshot().GetFidelity())
+	// sandboxRec.NestedContainers is deliberately carried over from the on-node
+	// record (read above by readSandboxRecord) UNCHANGED: it holds the effective
+	// nested-container flags, the ones this sandbox was created (Run) or restored
+	// (Restore) with, which is what a later memory restore must match. This
+	// Checkpoint request's spec is NOT consulted, because it states what the
+	// template asks for now, not what runsc is actually running: after a DATA
+	// cold-boot restore into a repointed template the two can differ, and
+	// pinning the request's value would record a flag the sandbox never had
+	// (the stale-record wedge).
 
 	tPersist := time.Now()
+
+	// For a network worker, the checkpoint files are on the GUEST, not on this
+	// node, so pull EXACTLY the set the guest reported into node custody
+	// (checkpointDir) before any persist reads from it and before the guest is
+	// removed. moveLocalCheckpoint and uploadExternalCheckpoint then run from
+	// node custody unchanged, and a later PromoteSnapshot (paused upload) works
+	// even after the guest is gone. Fail CLOSED: on any pull error the checkpoint
+	// is NOT reported taken and the guest is NOT cleaned up; Export leaves node
+	// custody untouched (it stages to a temp dir and renames atomically, refusing
+	// to overwrite nonempty custody), so the transfer itself is retryable. The
+	// Checkpoint RPC as a whole is not necessarily retryable: CheckpointWorkload
+	// has already deleted the workload, so a retry can at best redo the transfer,
+	// not re-take the checkpoint. The pulled set is exactly the files the guest's
+	// checkpoint listed: SnapshotFiles is the COMPLETE set and DataSnapshotFiles
+	// is a subset of it (validateDataSnapshotFiles), so only SnapshotFiles is
+	// passed -- appending the data files would duplicate members, and Export
+	// rejects a membership with duplicates. For a colocated worker activation is
+	// nil and this is a no-op: its files already sit in checkpointDir on the
+	// shared filesystem.
+	if activation != nil {
+		if err := s.receiveNetworkCheckpoint(opCtx, activation, sandboxRec.SnapshotFiles, checkpointDir); err != nil {
+			dPersist = time.Since(tPersist)
+			return nil, fmt.Errorf("while transferring checkpoint into node custody: %w", err)
+		}
+	}
+
 	var state *ateletpb.ActorSnapshotState
 	switch mode := req.GetUploadConfig().GetMode(); mode {
 	case ateletpb.UploadMode_UPLOAD_MODE_DEFERRED:
@@ -1179,13 +1329,40 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	}
 	dPersist = time.Since(tPersist)
 
-	tCleanup := time.Now()
-	err = s.cleanUpAfterCheckpoint(opCtx, req, state.GetLatestLocal() != nil)
-	dCleanup = time.Since(tCleanup)
-	if err != nil {
-		return nil, err
+	// Node custody and the snapshot are durable now, so after the node-side
+	// cleanup the guest's staged artifacts can be discarded. The guest cleanup
+	// acts only on the GUEST-side staged copy through the network worker; it
+	// does not touch the node's local snapshots cleanUpAfterCheckpoint keeps, so
+	// the two are independent and both always run. Best-effort: worker removal
+	// reclaims the guest anyway, so a guest cleanup error is logged, not
+	// returned. No-op for a colocated worker (activation nil). A retried
+	// Checkpoint answered by committedCheckpointState does not clean the guest
+	// copy; removing the worker reclaims it.
+	cleanupErr, guestErr := finishCheckpointCleanup(
+		func() error {
+			tCleanup := time.Now()
+			err := s.cleanUpAfterCheckpoint(opCtx, req, state.GetLatestLocal() != nil)
+			dCleanup = time.Since(tCleanup)
+			return err
+		},
+		func() error { return s.cleanupNetworkActor(opCtx, activation) },
+	)
+	if guestErr != nil {
+		slog.WarnContext(opCtx, "network worker actor cleanup incomplete after checkpoint", slog.Any("actor", actorRef), slog.Any("err", guestErr))
+	}
+	if cleanupErr != nil {
+		return nil, cleanupErr
 	}
 	return &ateletpb.CheckpointResponse{State: state}, nil
+}
+
+// finishCheckpointCleanup runs the node-side cleanup of a committed checkpoint
+// and then the guest-side cleanup, the second whether the first failed or
+// panicked, and returns both errors. Only the node-side error fails the
+// checkpoint.
+func finishCheckpointCleanup(node, guest func() error) (nodeErr, guestErr error) {
+	defer func() { guestErr = guest() }()
+	return node(), nil
 }
 
 // committedCheckpointState returns the actor's state for a retry of a
@@ -1622,6 +1799,9 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	if errs := apivalidation.ValidateRestoreRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
 	}
+	if err := s.validateNetworkSpec(req.GetSpec()); err != nil {
+		return nil, err
+	}
 
 	actorUID := req.GetActorUid()
 	actor := actorRef{atespace: req.GetAtespace(), name: req.GetActorName(), uid: actorUID}
@@ -1634,6 +1814,14 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	// nothing.
 	runtimeRec, err := s.advertisedRuntime(ctx, req.GetSandboxRuntime())
 	if err != nil {
+		return nil, err
+	}
+	if err := s.validateNetworkSandbox(runtimeRec.SandboxClass); err != nil {
+		return nil, err
+	}
+	// Same nested-opt-in-requires-gVisor guard as Run (see validateNestedSandbox):
+	// the restored sandbox must be able to honor the opt-in the request carries.
+	if err := validateNestedSandbox(req.GetSpec().GetNestedContainers(), runtimeRec.SandboxClass); err != nil {
 		return nil, err
 	}
 
@@ -1772,8 +1960,43 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	dManifest = time.Since(tManifest)
 	manifestDone = true
 
+	// NETWORK-worker local restore. A directLocal restore
+	// restores in place from LocalSnapshotDir, relying on the worker sharing the node filesystem.
+	// That holds for a COLOCATED worker, but a NETWORK worker runs in a separate pod/filesystem and
+	// only receives the files Stage pushes (internal/workerstaging/archive.go actorRoots, which
+	// lists restore-state but NOT local-checkpoint). So a network worker's directLocal restore left
+	// the guest with no checkpoint.img and `runsc restore` FATAL'd (exit 128) -- deterministic for a
+	// same-node resume whose local copy is present. To avoid that, for a
+	// network worker, stage the verified local snapshot into restore-state (which IS pushed) by
+	// copying EXACTLY the manifest's files, point RestoreDir there, and tell the worker NOT to
+	// preserve that dir (the guest copy is disposable; the node's local snapshot is untouched).
+	// op.kind stays local. The COLOCATED path is unchanged (networkLocalStage is false when
+	// s.network == nil), so it still restores in place with PreserveRestoreDir=true and no staging.
+	networkLocalStage := wantsNetworkLocalStage(directLocal, s.network != nil)
+	if networkLocalStage {
+		// Stage into restore-state (in actorRoots -> pushed to the guest), not local-checkpoint.
+		checkpointDir = ateletpath.RestoreStateDir(actorUID)
+	}
+
 	// The snapshot kind is recorded once the manifest has been read.
 	op.kind = restoreSnapshotKind(directLocal, sandboxRec)
+
+	// Refuse a restore whose nested-container opt-in differs from the one the
+	// memory image was captured with. gVisor restores a memory image only under
+	// the same runsc top-level flags it was created with, so a mismatch
+	// would otherwise fail deep in runsc; fail closed here with the typed
+	// ateerrors error instead (gVisor itself does NOT refuse a mismatched
+	// -net-raw restore, so this refusal is required). Only a
+	// MEMORY-fidelity restore loads a memory image; VOLUMES (and ROOTFS) create
+	// the sandbox fresh with the current flags, so they need no check. The
+	// golden first-resume also restores a MEMORY snapshot, so gating on MEMORY
+	// covers it. sandboxRec is the snapshot's manifest, whose recorded flags are
+	// the ones the restored memory image requires.
+	if req.GetSnapshot().GetFidelity() == ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
+		if err := checkNestedRuntimeCompatible(sandboxRec.NestedContainers, req.GetSpec().GetNestedContainers()); err != nil {
+			return nil, err
+		}
+	}
 
 	var registration *registeredActor
 	// Undo the Register if the restore fails. The errgroup join below happens
@@ -1803,9 +2026,27 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 			}
 			downloadErr = err
 		}()
+		if networkLocalStage {
+			// Network worker: copy EXACTLY the manifest's files from the node-local snapshot into
+			// restore-state so Stage pushes them to the fresh guest (copyLocalCheckpoint links with
+			// a copy fallback, is confined to the actor dir via os.OpenRoot, and refuses a
+			// non-regular/symlink or an unlisted file -- same membership rule as the manifest).
+			// Fail closed: on error, return so the worker RPC is NOT called (g.Wait returns before
+			// the dial), so no partial restore-state is ever staged into a guest. The RemoveAll is a
+			// best-effort tidy of the node-side partial dir; if it fails the RPC is still skipped and
+			// resetActorDirs reclaims the dir at the actor's next activation, so the fail-closed
+			// property does not depend on it.
+			if cerr := s.copyLocalCheckpoint(gctx, ateletpath.ActorSnapshotPath(actorUID),
+				req.GetSnapshot().GetSnapshotUuid(), ateletpath.LocalCheckpointsDir(actorUID),
+				checkpointDir, localRec.SnapshotFiles); cerr != nil {
+				_ = os.RemoveAll(checkpointDir)
+				return fmt.Errorf("while staging the local snapshot into restore-state for a network worker: %w", cerr)
+			}
+			return nil
+		}
 		if directLocal {
-			// Restore in place from LocalSnapshotDir, whose files
-			// readLocalSnapshot checked; no staging.
+			// COLOCATED worker: restore in place from LocalSnapshotDir, whose files
+			// readLocalSnapshot checked; no staging (the worker shares the node filesystem).
 			return nil
 		}
 		// Cache-eligible only when the control plane declared the snapshot
@@ -1862,12 +2103,36 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	// Record the sandbox binaries running the guest on-node before
 	// RestoreWorkload, as Run does before RunWorkload, so a Checkpoint or
 	// Terminate can resolve the runtime as soon as the sandbox is started.
-	if err := writeSandboxRecord(actorUID, runtimeRec); err != nil {
+	//
+	// The nested-container flags are set OR cleared from the restore request, not
+	// copied from the manifest: they are the flags ateworker restores the
+	// sandbox with. For a MEMORY restore the check above has already proved they
+	// equal the manifest's; a VOLUMES cold boot creates the sandbox fresh under
+	// the current template, which may have been repointed across the opt-in, so
+	// the record must follow the spec, not the old manifest. Copy runtimeRec so
+	// the shared record (used by prepareOCIBundles above) is not mutated.
+	nodeRec := *runtimeRec
+	nodeRec.NestedContainers = nestedContainersManifestFromSpec(req.GetSpec().GetNestedContainers())
+	if err := writeSandboxRecord(actorUID, &nodeRec); err != nil {
 		return nil, err
 	}
 
 	actorDirs := ateletpath.ActorDirs(actorUID)
 	actorDirs.RestoreDir = checkpointDir
+
+	// For a network worker, push the image layers, runtime assets and actor
+	// state into the fresh guest BEFORE the worker RPC. The actor state includes
+	// the restore-state directory, which the download/copy leg above populated
+	// with the checkpoint files, so a MEMORY restore's memory image reaches the
+	// guest. This runs AFTER the nested-runtime refusal above (a mismatched
+	// memory-bearing restore has already been rejected, so nothing is staged
+	// into a guest for a restore that must not proceed) and AFTER the errgroup
+	// (restore-state, the OCI bundles and the assets are all ready). FAIL
+	// CLOSED: if staging fails the worker RestoreWorkload below is not called.
+	// Colocated: no-op.
+	if _, err := s.stageNetworkActivation(ctx, actorRef, actorUID, req.GetWorkerPodUid(), assetPaths); err != nil {
+		return nil, fmt.Errorf("while staging network activation: %w", err)
+	}
 
 	// The worker_restore phase is opaque from here; worker logs its own breakdown of
 	// this call as "Actor restore phases".
@@ -1883,9 +2148,12 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		Fidelity:              toWorkerFidelity(req.GetSnapshot().GetFidelity()),
 		ActorUid:              req.GetActorUid(),
 		ActorDirs:             actorDirs,
-		PreserveRestoreDir:    directLocal,
-		EgressGateway:         toWorkerEgressGateway(req.GetEgressGateway()),
-		Resources:             toAteworkerResources(req.GetResources()),
+		// COLOCATED directLocal preserves RestoreDir (it IS the node's LocalSnapshotDir, kept). The
+		// network-local case restores from a disposable COPY in restore-state, so do not preserve it
+		// (the node's local snapshot is untouched regardless). See preserveRestoreDirForLocal.
+		PreserveRestoreDir: preserveRestoreDirForLocal(directLocal, networkLocalStage),
+		EgressGateway:      toWorkerEgressGateway(req.GetEgressGateway()),
+		Resources:          toAteworkerResources(req.GetResources()),
 	})
 	dWorker = time.Since(tWorker)
 	if err != nil {
@@ -2179,6 +2447,28 @@ func (s *Atelet) terminateWorkloadOnWorker(ctx context.Context, req *ateletpb.Te
 	return nil
 }
 
+// wantsNetworkLocalStage reports whether a directLocal restore must stage the
+// node-local snapshot into restore-state for a network worker. It is true ONLY for a directLocal restore on a
+// network worker: a colocated worker (networkEnabled false) shares the node
+// filesystem and restores in place, and a non-directLocal restore already
+// downloads into restore-state. Extracted as a pure function so the gating that
+// drives both the restore-state staging AND PreserveRestoreDir below is tested
+// directly, both ways, independent of the staging machinery.
+func wantsNetworkLocalStage(directLocal, networkEnabled bool) bool {
+	return directLocal && networkEnabled
+}
+
+// preserveRestoreDirForLocal is the PreserveRestoreDir the worker RestoreWorkload
+// request carries. A COLOCATED directLocal restore preserves RestoreDir (it IS the
+// node's kept LocalSnapshotDir); the network-staged case restores from a disposable
+// COPY in restore-state, so it must NOT be preserved; a non-directLocal restore does
+// not preserve either. Extracted alongside wantsNetworkLocalStage so the exact
+// expression main.go sends is the one the gating test pins, making the "keep true for
+// the network case" and "preserve on colocated only when ..." variants fail a test.
+func preserveRestoreDirForLocal(directLocal, networkLocalStage bool) bool {
+	return directLocal && !networkLocalStage
+}
+
 // checkLocalSnapshotFiles verifies each snapshot file exists in dir as a
 // regular file. Lstat via os.Root, so a symlink cannot point worker outside the
 // snapshot.
@@ -2241,6 +2531,10 @@ func (s *Atelet) prepareOCIBundles(
 	actorRef resources.ActorRef,
 	spec *ateletpb.WorkloadSpec,
 ) ([]*ateworkerpb.ContainerSpec, error) {
+	if err := checkNestedOnlyCapabilities(spec); err != nil {
+		return nil, err
+	}
+
 	// Prepare host folders for volume types that need them.
 	for _, vol := range spec.GetVolumes() {
 		if vol.GetDurableDir() != nil {
@@ -2313,7 +2607,9 @@ func buildWorkerWorkloadSpec(spec *ateletpb.WorkloadSpec, containerSpecs []*atew
 		volumes[name] = vol
 	}
 
-	out := &ateworkerpb.WorkloadSpec{}
+	out := &ateworkerpb.WorkloadSpec{
+		NestedContainers: toWorkerNestedContainers(spec.GetNestedContainers()),
+	}
 	for i, ctr := range spec.GetContainers() {
 		var ddMounts []*ateworkerpb.VolumeMount
 		var extMounts []*ateworkerpb.VolumeMount
@@ -2385,6 +2681,22 @@ func toWorkerEgressGateway(gateway *ateletpb.EgressGateway) *ateworkerpb.EgressG
 	return &ateworkerpb.EgressGateway{Address: gateway.GetAddress()}
 }
 
+// toWorkerNestedContainers forwards the nested-containers opt-in from the
+// ateletpb spec onto the ateworkerpb wire type. Returns nil when the source is
+// nil or disabled, so a default actor's worker-side spec carries no nested
+// config and stays byte-for-byte unchanged. ate-api-server already parsed the
+// image-store quantity to bytes, so this hop only copies the scalars.
+func toWorkerNestedContainers(in *ateletpb.NestedContainers) *ateworkerpb.NestedContainers {
+	if in == nil || !in.GetEnabled() {
+		return nil
+	}
+	return &ateworkerpb.NestedContainers{
+		Enabled:             true,
+		PacketSocketWrite:   in.GetPacketSocketWrite(),
+		ImageStoreSizeBytes: in.GetImageStoreSizeBytes(),
+	}
+}
+
 // toWorkerWakeupProbe converts an ateletpb wakeup probe into the ateworkerpb wire
 // type. Returns nil when the source is nil so containers without a probe
 // stay unchanged on the wire to worker.
@@ -2405,6 +2717,12 @@ func toWorkerWakeupProbe(in *ateletpb.WakeupProbe) *ateworkerpb.WakeupProbe {
 
 type WorkerDialer struct {
 	conns *lru.Cache
+	// network is nil by default (colocated workers over the Unix socket). When
+	// --network-workers is set it is the node-scoped network-worker inventory
+	// and mTLS dialer; DialWorkerPod then dials a worker Pod over authenticated
+	// Pod networking instead of the Unix socket. Set once at startup, before any
+	// RPC can reach the dialer, so it needs no lock.
+	network *nodeWorkerNetwork
 }
 
 // newWorkerDialer builds a dialer whose cache closes the connections it
@@ -2434,17 +2752,37 @@ var workerSocketPath = nodepath.WorkerSocketPath
 
 func (d *WorkerDialer) DialWorkerPod(ctx context.Context, podUID string) (*grpc.ClientConn, error) {
 	key := podUID
+	if d.network != nil {
+		// Key the cache by UID AND the resolved address so a worker Pod replaced
+		// at the same UID (which cannot happen) or a stale entry cannot alias a
+		// different endpoint. Resolve fails closed for a worker not in the live
+		// inventory, so a colocated or absent worker never reaches the dial.
+		address, _, err := d.network.directory.Resolve(podUID)
+		if err != nil {
+			return nil, err
+		}
+		key += "/" + address
+	}
 
 	connAny, ok := d.conns.Get(key)
 	if ok {
 		return connAny.(*grpc.ClientConn), nil
 	}
 
-	conn, err := grpc.NewClient(
-		"unix://"+workerSocketPath(podUID),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
-	)
+	var conn *grpc.ClientConn
+	var err error
+	if d.network != nil {
+		// Network worker: mTLS over Pod networking, no plaintext or Unix
+		// fallback. The byte-for-byte unchanged Unix path below is taken only
+		// when network workers are disabled.
+		conn, err = d.network.dial(podUID)
+	} else {
+		conn, err = grpc.NewClient(
+			"unix://"+workerSocketPath(podUID),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("while creating atelet gRPC client connection: %w", err)
 	}

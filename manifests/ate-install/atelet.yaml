@@ -122,7 +122,37 @@ spec:
       values: ["system-node-critical", "system-cluster-critical"]
 
 ---
-# 6. Create DaemonSet
+# 6. Create the atelet-workers Service
+# Fronts atelet's networked WorkerSupport listener (--network-workers,
+# --worker-services-listen-address :8087) for the workers of a networkTransport
+# pool. The name and port are the install contract the controller builds
+# --atelet-address from; see networkWorkerArgs in
+# cmd/atecontroller/internal/controllers/workerpool_apply.go.
+#
+# internalTrafficPolicy routes a worker to the atelet on its own node. atelet's
+# worker inventory is node-scoped, so it only authorizes and dials workers it
+# shares a node with, and a cluster-wide round robin would reach an atelet that
+# does not know the caller.
+apiVersion: v1
+kind: Service
+metadata:
+  name: atelet-workers
+  namespace: ate-system
+  labels:
+    app: atelet
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    app: atelet
+  ports:
+  - name: worker-svcs
+    port: 8087
+    targetPort: worker-svcs
+    protocol: TCP
+
+---
+# 7. Create DaemonSet
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -269,6 +299,23 @@ spec:
         - --drain-delay=0s
         - --drain-timeout=5m
         - --objectstore-plugin-socket=/run/objectstore-plugin/node.sock
+        # Serve WorkerSupport over Pod networking as well as the Unix socket, for
+        # the workers of a networkTransport pool, which run in their own guest
+        # Pod and cannot reach the node-local socket. Workers reach it through
+        # the atelet-workers Service above.
+        #
+        # The stock install opens this listener on every atelet, whether or not
+        # the NetworkWorkers preview gate is enabled: atelet does not read that
+        # gate (the controller checks it for spec.networkTransport). What
+        # protects the listener is mTLS plus atelet's node-scoped worker
+        # inventory: the caller's Pod certificate must name a running Pod on
+        # this node that runs as --network-worker-service-account and carries
+        # the ate.dev/worker-transport=network and ate.dev/worker-pool labels.
+        # Those labels can be set on any Pod, so registering also needs the
+        # Worker record the control plane keeps for that Pod. It is not the
+        # gate and not the Service; the ate-system NetworkPolicy only narrows
+        # who can connect.
+        - --network-workers
         # atelet does no mounts, netlink, device, or namespace operations (those
         # live in the worker pod) — it only reads/writes the
         # /var/lib/ate hostPath as root. These capabilities exist because
@@ -341,6 +388,9 @@ spec:
           protocol: TCP
         - name: health
           containerPort: 9091
+          protocol: TCP
+        - name: worker-svcs
+          containerPort: 8087
           protocol: TCP
         readinessProbe:
           httpGet:

@@ -42,6 +42,8 @@ import (
 	"go.ate.dev/substrate/cmd/atelet/internal/atomicfile"
 	"go.ate.dev/substrate/cmd/atelet/internal/filecache"
 	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/ateerrors"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/objectstorage"
 	"google.golang.org/grpc/codes"
@@ -112,6 +114,60 @@ type sandboxAssetsRecord struct {
 	// reboot. Set only in the manifest of a local copy, never in an uploaded
 	// one.
 	BootID string `json:"bootId,omitempty"`
+	// NestedContainers records the effective nested-container opt-in the sandbox
+	// was created or restored with (the runsc top-level flags). It is set on
+	// the on-node record at Run and Restore and copied into the snapshot manifest
+	// at Checkpoint, so Restore can refuse a memory-bearing restore whose opt-in
+	// differs from the capture's. nil (omitted) means "not nested", so a
+	// legacy manifest, a default actor, and a snapshot from before this field
+	// all read as not nested.
+	NestedContainers *nestedContainersManifest `json:"nestedContainers,omitempty"`
+}
+
+// nestedContainersManifest is the manifest form of the effective nested-container
+// opt-in. Only the fields that change the runsc top-level flags are recorded,
+// because only they constrain which memory image a restore can load; the
+// image-store size is not a restore constraint (it shapes the tmpfs at create,
+// not the saved memory image's compatibility).
+type nestedContainersManifest struct {
+	Enabled           bool `json:"enabled"`
+	PacketSocketWrite bool `json:"packetSocketWrite,omitempty"`
+}
+
+// nestedContainersManifestFromSpec projects the worker-side opt-in onto the
+// manifest form. Returns nil when the opt-in is absent or disabled, so the
+// record (on-node or snapshot) omits the key and reads back as "not nested".
+func nestedContainersManifestFromSpec(n *ateletpb.NestedContainers) *nestedContainersManifest {
+	if n == nil || !n.GetEnabled() {
+		return nil
+	}
+	return &nestedContainersManifest{
+		Enabled:           true,
+		PacketSocketWrite: n.GetPacketSocketWrite(),
+	}
+}
+
+// checkNestedRuntimeCompatible reports an error when a snapshot's recorded
+// nested-container opt-in (nil = not nested) differs from the one the restore
+// spec carries. Both the enabled flag (-net-raw) and packet-socket-write
+// (-allow-packet-socket-write) must match, because gVisor restores a memory
+// image only under the same runsc top-level flags it was captured with. The
+// comparison is symmetric, so it catches a nested snapshot into a plain spec
+// and a plain snapshot into a nested spec alike. The returned error is the
+// typed ateerrors.SnapshotRuntimeMismatch (FailedPrecondition).
+func checkNestedRuntimeCompatible(recorded *nestedContainersManifest, spec *ateletpb.NestedContainers) error {
+	recEnabled := recorded != nil && recorded.Enabled
+	recPSW := recorded != nil && recorded.PacketSocketWrite
+	specEnabled := spec.GetEnabled()
+	// packet-socket-write only takes effect alongside enabled (admission
+	// guarantees it), so a disabled spec reads as no packet-socket-write.
+	specPSW := spec.GetEnabled() && spec.GetPacketSocketWrite()
+	if recEnabled == specEnabled && recPSW == specPSW {
+		return nil
+	}
+	return ateerrors.SnapshotRuntimeMismatch(fmt.Sprintf(
+		"snapshot was captured with nested containers {enabled:%t packetSocketWrite:%t} but the actor's template now asks for {enabled:%t packetSocketWrite:%t}; a memory snapshot can only be restored under the sandbox flags it was captured with",
+		recEnabled, recPSW, specEnabled, specPSW))
 }
 
 // ensureSandboxAssets stages every asset in the record under dstDir, named

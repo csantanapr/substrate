@@ -118,6 +118,24 @@ func ValidateCustom_CreateActorTemplateRequest_ActorTemplate(_ context.Context, 
 	return errs
 }
 
+// ValidateCustom_ActorTemplate forbids resources.NestedContainersAddCapabilities
+// in every container's securityContext.capabilities.add unless the template
+// sets runtime.nested_containers.enabled, which is itself forbidden while the
+// NestedContainers preview gate is off. ValidateCustom_Capabilities_Add accepts
+// these names field by field; this check is attached to the ActorTemplate type,
+// so every path that validates a template (Validate_ActorTemplate) runs it, and
+// an update whose containers are unchanged does not skip it.
+func ValidateCustom_ActorTemplate(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *ateapi.ActorTemplate) field.ErrorList {
+	nested := value.GetRuntime().GetNestedContainers().GetEnabled()
+	var errs field.ErrorList
+	for i, ctr := range value.GetContainers() {
+		errs = append(errs, resources.ValidateNestedContainersAddCapabilities(
+			fldPath.Child("containers").Index(i).Child("security_context", "capabilities", "add"),
+			ctr.GetSecurityContext().GetCapabilities().GetAdd(), nested, "runtime.nested_containers.enabled")...)
+	}
+	return errs
+}
+
 // Bounds on NestedContainersConfig.image_store_size, as documented on the
 // field. The floor keeps a nested runtime's image store usable at all; the
 // ceiling bounds the tmpfs a MEMORY snapshot captures as memory.
@@ -274,8 +292,14 @@ func ValidateCustom_EnvVar_Name(_ context.Context, _ operation.Operation, fldPat
 	return resources.ValidateEnvVarName(fldPath, *value)
 }
 
+// ValidateCustom_Capabilities_Add also accepts the nested-only capabilities
+// (resources.NestedContainersAddCapabilities): it sees one field, not the
+// opt-in. ValidateCustom_ActorTemplate, on the enclosing ActorTemplate, rejects
+// them for a template without runtime.nested_containers.enabled. Validating a
+// Container, SecurityContext or Capabilities on its own therefore does not
+// enforce the opt-in; every service path validates the whole ActorTemplate.
 func ValidateCustom_Capabilities_Add(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []string) field.ErrorList {
-	return resources.ValidateAddCapabilities(fldPath, value)
+	return resources.ValidateAddCapabilitiesAllowingNested(fldPath, value)
 }
 
 func ValidateCustom_Capabilities_Drop(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []string) field.ErrorList {

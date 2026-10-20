@@ -24,6 +24,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/resources"
 	"google.golang.org/protobuf/testing/protocmp"
 )
 
@@ -244,6 +245,62 @@ func TestResolveCwd(t *testing.T) {
 		if (err != nil) != tc.wantErr || got != tc.want {
 			t.Errorf("resolveCwd(%+v) = %q, %v; want %q, wantErr %v", tc.image, got, err, tc.want, tc.wantErr)
 		}
+	}
+}
+
+// TestResolveCapabilitiesNestedContainers is the golden for a nested-containers
+// container: the 12-name add list documented for nested templates resolves to
+// exactly the 15 capabilities that were measured to run Docker 27.5.1 with
+// runc 1.2.4 inside a standalone gVisor sandbox (the default 3 plus the 12).
+// The worker writes this one list as the bounding, effective and permitted
+// sets, with inheritable and ambient empty.
+func TestResolveCapabilitiesNestedContainers(t *testing.T) {
+	add := []string{
+		"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+		"MKNOD", "NET_ADMIN", "SYS_ADMIN",
+	}
+	want := []string{
+		"CAP_AUDIT_WRITE", "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL",
+		"CAP_MKNOD", "CAP_NET_ADMIN", "CAP_NET_BIND_SERVICE", "CAP_SETFCAP", "CAP_SETGID", "CAP_SETPCAP",
+		"CAP_SETUID", "CAP_SYS_ADMIN", "CAP_SYS_CHROOT",
+	}
+	if len(want) != 15 {
+		t.Fatalf("want has %d names, the measured set has 15", len(want))
+	}
+	if got := resolveCapabilities(&ateletpb.Capabilities{Add: add}); !slices.Equal(got, want) {
+		t.Errorf("resolveCapabilities(nested add list) = %v, want %v", got, want)
+	}
+}
+
+// TestCheckNestedOnlyCapabilities pins atelet's second refusal of the
+// nested-only capabilities, after ValidateCustom_WorkloadSpec at the RPC edge.
+func TestCheckNestedOnlyCapabilities(t *testing.T) {
+	spec := func(nested *ateletpb.NestedContainers, add ...string) *ateletpb.WorkloadSpec {
+		return &ateletpb.WorkloadSpec{
+			NestedContainers: nested,
+			Containers: []*ateletpb.Container{
+				{Name: "main"},
+				{Name: "app", SecurityContext: &ateletpb.SecurityContext{Capabilities: &ateletpb.Capabilities{Add: add}}},
+			},
+		}
+	}
+	for _, c := range []string{"MKNOD", "NET_ADMIN", "SYS_ADMIN"} {
+		for _, nested := range []*ateletpb.NestedContainers{nil, {Enabled: false}} {
+			err := checkNestedOnlyCapabilities(spec(nested, "CHOWN", c))
+			if err == nil || !strings.Contains(err.Error(), `container "app" adds `+c+" without nested_containers.enabled") {
+				t.Errorf("nested %v, add %s: err = %v, want the nested-only refusal", nested, c, err)
+			}
+		}
+		if err := checkNestedOnlyCapabilities(spec(&ateletpb.NestedContainers{Enabled: true}, "CHOWN", c)); err != nil {
+			t.Errorf("nested on, add %s: err = %v, want nil", c, err)
+		}
+	}
+	if err := checkNestedOnlyCapabilities(spec(nil, "CHOWN", "SYS_CHROOT", "NET_BIND_SERVICE")); err != nil {
+		t.Errorf("nested off, allowed names: err = %v, want nil", err)
+	}
+	// prepareOCIBundles refuses before it touches the host or the image cache.
+	if _, err := (&Atelet{}).prepareOCIBundles(t.Context(), "uid", resources.ActorRef{}, spec(nil, "SYS_ADMIN")); err == nil {
+		t.Error("prepareOCIBundles(nested off, SYS_ADMIN) = nil error, want the nested-only refusal")
 	}
 }
 

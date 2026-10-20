@@ -33,12 +33,23 @@ import (
 // volume the spec does not declare, mirroring the template-side rule, so a
 // dangling mount is refused at the RPC edge rather than after atelet has
 // already reset the actor's directories and mounted its external volumes.
+// It also refuses resources.NestedContainersAddCapabilities in any container's
+// capabilities.add unless nested_containers.enabled is set, mirroring
+// ateapi's ValidateCustom_ActorTemplate: ValidateCustom_Capabilities_Add
+// accepts them field by field, and every RPC that carries a WorkloadSpec (Run,
+// Restore, Checkpoint, Terminate) runs this check.
 func ValidateCustom_WorkloadSpec(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *ateletpb.WorkloadSpec) field.ErrorList {
 	declared := sets.New[string]()
 	for _, vol := range value.GetVolumes() {
 		declared.Insert(vol.GetName())
 	}
 	var errs field.ErrorList
+	nested := value.GetNestedContainers().GetEnabled()
+	for i, ctr := range value.GetContainers() {
+		errs = append(errs, resources.ValidateNestedContainersAddCapabilities(
+			fldPath.Child("containers").Index(i).Child("security_context", "capabilities", "add"),
+			ctr.GetSecurityContext().GetCapabilities().GetAdd(), nested, "nested_containers.enabled")...)
+	}
 	for i, ctr := range value.GetContainers() {
 		for j, mount := range ctr.GetVolumeMounts() {
 			name := mount.GetName()
@@ -77,8 +88,14 @@ func ValidateCustom_Container_VolumeMounts(_ context.Context, _ operation.Operat
 	return resources.ValidateNestedMountPaths(fldPath, paths)
 }
 
+// ValidateCustom_Capabilities_Add also accepts the nested-only capabilities
+// (resources.NestedContainersAddCapabilities): it sees one field, not the
+// opt-in. ValidateCustom_WorkloadSpec, on the enclosing WorkloadSpec, rejects
+// them for a spec without nested_containers.enabled. Validating a Container,
+// SecurityContext or Capabilities on its own therefore does not enforce the
+// opt-in; every RPC validates the whole WorkloadSpec.
 func ValidateCustom_Capabilities_Add(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []string) field.ErrorList {
-	return resources.ValidateAddCapabilities(fldPath, value)
+	return resources.ValidateAddCapabilitiesAllowingNested(fldPath, value)
 }
 
 func ValidateCustom_Capabilities_Drop(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []string) field.ErrorList {

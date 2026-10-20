@@ -1816,8 +1816,11 @@ func TestValidateContainer(t *testing.T) {
 			obj:  caps(nil, []string{"NET_ADIMN"}),
 			want: field.ErrorList{field.NotSupported[string](capsPath.Child("drop").Index(0), nil, nil)},
 		}, {
+			// MKNOD, NET_ADMIN and SYS_ADMIN pass a lone Container; the
+			// WorkloadSpec check refuses them without the nested-containers
+			// opt-in (TestWorkloadSpecNestedContainersAddCapabilities).
 			name: "capabilities: add outside the allowlist rejected",
-			obj:  caps([]string{"MKNOD", "SYS_ADMIN"}, nil),
+			obj:  caps([]string{"NET_RAW", "SYS_PTRACE"}, nil),
 			want: field.ErrorList{
 				field.NotSupported[string](capsPath.Child("add").Index(0), nil, nil),
 				field.NotSupported[string](capsPath.Child("add").Index(1), nil, nil),

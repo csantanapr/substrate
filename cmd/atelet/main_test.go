@@ -1700,6 +1700,41 @@ func TestShouldHaveSnapshots(t *testing.T) {
 	}
 }
 
+// TestBuildWorkerWorkloadSpecForwardsNestedContainers pins the atelet forwarding hop
+// both ways: an enabled opt-in is forwarded onto the ateworkerpb spec; an
+// absent or disabled one leaves NestedContainers nil so a default actor's
+// worker-side spec is unchanged.
+func TestBuildWorkerWorkloadSpecForwardsNestedContainers(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   *ateletpb.NestedContainers
+		want *ateworkerpb.NestedContainers
+	}{
+		{"nil", nil, nil},
+		{"disabled", &ateletpb.NestedContainers{Enabled: false, PacketSocketWrite: true, ImageStoreSizeBytes: 1 << 30}, nil},
+		{"enabled", &ateletpb.NestedContainers{Enabled: true}, &ateworkerpb.NestedContainers{Enabled: true}},
+		{
+			"enabled with write and size",
+			&ateletpb.NestedContainers{Enabled: true, PacketSocketWrite: true, ImageStoreSizeBytes: 1 << 30},
+			&ateworkerpb.NestedContainers{Enabled: true, PacketSocketWrite: true, ImageStoreSizeBytes: 1 << 30},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			in := &ateletpb.WorkloadSpec{
+				Containers:       []*ateletpb.Container{{Name: "main"}},
+				NestedContainers: tt.in,
+			}
+			got, err := buildWorkerWorkloadSpec(in, nil)
+			if err != nil {
+				t.Fatalf("buildWorkerWorkloadSpec = %v", err)
+			}
+			if diff := cmp.Diff(tt.want, got.GetNestedContainers(), protocmp.Transform()); diff != "" {
+				t.Errorf("NestedContainers mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 // TestServingCheck pins the readiness contract at startup: /readyz holds
 // 503 until main has opened the gRPC port, whatever else is already up.
 func TestServingCheck(t *testing.T) {

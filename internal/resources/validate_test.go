@@ -19,7 +19,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -598,6 +600,93 @@ func TestValidateCapabilities(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAddCapabilitiesEveryLinuxName pins, over every Linux capability name,
+// which ones each add validator accepts: exactly the 12 AllowedAddCapabilities
+// for ValidateAddCapabilities, and those plus MKNOD, NET_ADMIN and SYS_ADMIN for
+// ValidateAddCapabilitiesAllowingNested.
+func TestAddCapabilitiesEveryLinuxName(t *testing.T) {
+	base := sets.New(
+		"AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+		"NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+	)
+	nested := sets.New("MKNOD", "NET_ADMIN", "SYS_ADMIN")
+	if n := linuxCapabilities.Len(); n != 41 {
+		t.Fatalf("linuxCapabilities has %d names, want 41", n)
+	}
+	if !AllowedAddCapabilities.Equal(base) {
+		t.Errorf("AllowedAddCapabilities = %v, want %v", sets.List(AllowedAddCapabilities), sets.List(base))
+	}
+	if !NestedContainersAddCapabilities.Equal(nested) {
+		t.Errorf("NestedContainersAddCapabilities = %v, want %v", sets.List(NestedContainersAddCapabilities), sets.List(nested))
+	}
+	var gotBase, gotNested []string
+	for _, c := range sets.List(linuxCapabilities) {
+		if len(ValidateAddCapabilities(field.NewPath("add"), []string{c})) == 0 {
+			gotBase = append(gotBase, c)
+		}
+		if len(ValidateAddCapabilitiesAllowingNested(field.NewPath("add"), []string{c})) == 0 {
+			gotNested = append(gotNested, c)
+		}
+	}
+	if want := sets.List(base); !slices.Equal(gotBase, want) {
+		t.Errorf("ValidateAddCapabilities accepts %v, want exactly %v", gotBase, want)
+	}
+	if want := sets.List(base.Union(nested)); !slices.Equal(gotNested, want) {
+		t.Errorf("ValidateAddCapabilitiesAllowingNested accepts %v, want exactly %v", gotNested, want)
+	}
+}
+
+// TestAddCapabilitiesAllowingNestedSameErrors proves the nested-aware add
+// validator reports every name outside its three extra names exactly as
+// ValidateAddCapabilities does: same error type, value, detail and list.
+func TestAddCapabilitiesAllowingNestedSameErrors(t *testing.T) {
+	inputs := [][]string{
+		{"ALL"}, {"NET_RAW"}, {"SYS_PTRACE"}, {"SYS_MODULE"}, {"DAC_READ_SEARCH"},
+		{"mknod"}, {"net_admin"}, {"Sys_Admin"}, {"CAP_MKNOD"}, {"CAP_SYS_ADMIN"},
+		{"NET_ADIMN"}, {""}, {strings.Repeat("A", 64)}, {"CAP_X", "ok", "CHOWN"},
+	}
+	for _, c := range sets.List(linuxCapabilities.Difference(AllowedAddCapabilities).Difference(NestedContainersAddCapabilities)) {
+		inputs = append(inputs, []string{c})
+	}
+	for _, in := range inputs {
+		want := ValidateAddCapabilities(field.NewPath("add"), in)
+		got := ValidateAddCapabilitiesAllowingNested(field.NewPath("add"), in)
+		if len(want) == 0 {
+			t.Errorf("%q: ValidateAddCapabilities accepted it; the case must be one it rejects", in)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%q: ValidateAddCapabilitiesAllowingNested = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestValidateNestedContainersAddCapabilities(t *testing.T) {
+	const optIn = "runtime.nested_containers.enabled"
+	add := []string{"CHOWN", "MKNOD", "NET_RAW", "NET_ADMIN", "SYS_PTRACE", "SYS_ADMIN", "mknod", "CAP_SYS_ADMIN"}
+	t.Run("opt-in off forbids exactly the three", func(t *testing.T) {
+		errs := ValidateNestedContainersAddCapabilities(field.NewPath("add"), add, false, optIn)
+		var got []string
+		for _, e := range errs {
+			if e.Type != field.ErrorTypeForbidden {
+				t.Errorf("error %v has type %v, want Forbidden", e, e.Type)
+			}
+			if !strings.Contains(e.Detail, optIn) {
+				t.Errorf("error detail %q does not name %s", e.Detail, optIn)
+			}
+			got = append(got, e.Field)
+		}
+		want := []string{"add[1]", "add[3]", "add[5]"}
+		if !slices.Equal(got, want) {
+			t.Errorf("forbidden fields = %v, want %v", got, want)
+		}
+	})
+	t.Run("opt-in on forbids nothing", func(t *testing.T) {
+		if errs := ValidateNestedContainersAddCapabilities(field.NewPath("add"), add, true, optIn); len(errs) != 0 {
+			t.Errorf("errs = %v, want none", errs)
+		}
+	})
 }
 
 func TestValidateNestedMountPaths(t *testing.T) {

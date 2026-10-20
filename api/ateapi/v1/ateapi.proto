@@ -1150,6 +1150,10 @@ message ObjectRef {
   string name = 2;
 }
 
+// An actor template: the containers, volumes and snapshot policy its actors
+// share.
+//
+// +k8s:customValidation # nested-only capabilities require runtime.nested_containers.enabled
 message ActorTemplate {
   option (resource) = {
     scope : SCOPE_ATESPACE
@@ -1467,12 +1471,16 @@ message SecurityContext {
 message Capabilities {
   // add lists capabilities to grant on top of the default set. Only
   // AUDIT_WRITE, CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE,
-  // SETFCAP, SETGID, SETPCAP, SETUID and SYS_CHROOT are accepted.
+  // SETFCAP, SETGID, SETPCAP, SETUID and SYS_CHROOT are accepted. A template
+  // with runtime.nested_containers.enabled may also add MKNOD, NET_ADMIN and
+  // SYS_ADMIN (measured to be needed by Docker 27.5.1 with runc 1.2.4 inside
+  // a gVisor sandbox). This field's own check accepts those three names; the
+  // check on the enclosing ActorTemplate enforces the opt-in.
   //
   // +k8s:optional
   // +k8s:maxItems=64
   // +k8s:listType=set
-  // +k8s:customValidation # one of resources.AllowedAddCapabilities
+  // +k8s:customValidation # one of resources.AllowedAddCapabilities, or also resources.NestedContainersAddCapabilities with runtime.nested_containers.enabled
   repeated string add = 1;
 
   // drop lists capabilities to remove from the default set. "ALL" drops the

@@ -32,6 +32,7 @@ import (
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/resources"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/errgroup"
@@ -78,6 +79,24 @@ func resolveCapabilities(caps *ateletpb.Capabilities) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// checkNestedOnlyCapabilities refuses resources.NestedContainersAddCapabilities
+// in any container's capabilities.add unless spec sets
+// nested_containers.enabled. ValidateCustom_WorkloadSpec already refuses them at
+// the RPC edge; this keeps a path that skipped it from granting them.
+func checkNestedOnlyCapabilities(spec *ateletpb.WorkloadSpec) error {
+	if spec.GetNestedContainers().GetEnabled() {
+		return nil
+	}
+	for _, ctr := range spec.GetContainers() {
+		for _, c := range ctr.GetSecurityContext().GetCapabilities().GetAdd() {
+			if resources.NestedContainersAddCapabilities.Has(c) {
+				return fmt.Errorf("container %q adds %s without nested_containers.enabled", ctr.GetName(), c)
+			}
+		}
+	}
+	return nil
 }
 
 // prepareOCIDirectory pulls the container's image and writes the overlay spec

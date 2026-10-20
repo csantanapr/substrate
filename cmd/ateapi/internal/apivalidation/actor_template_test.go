@@ -17,12 +17,15 @@ package apivalidation
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/internal/preview"
 	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
@@ -795,9 +798,17 @@ func TestValidateActorTemplate(t *testing.T) {
 	}, {
 		name: "capability outside the add allowlist",
 		mutate: func(tmpl *ateapi.ActorTemplate) {
-			tmpl.Containers[0].SecurityContext = &ateapi.SecurityContext{Capabilities: &ateapi.Capabilities{Add: []string{"MKNOD"}}}
+			tmpl.Containers[0].SecurityContext = &ateapi.SecurityContext{Capabilities: &ateapi.Capabilities{Add: []string{"NET_RAW"}}}
 		},
 		want: field.ErrorList{field.NotSupported[string](field.NewPath("containers").Index(0).Child("security_context", "capabilities", "add").Index(0), nil, nil)},
+	}, {
+		// Validate_ActorTemplate on its own, without the request wrapper,
+		// still refuses a nested-only capability without the opt-in.
+		name: "nested-only capability without the nested-containers opt-in",
+		mutate: func(tmpl *ateapi.ActorTemplate) {
+			tmpl.Containers[0].SecurityContext = &ateapi.SecurityContext{Capabilities: &ateapi.Capabilities{Add: []string{"MKNOD"}}}
+		},
+		want: field.ErrorList{field.Forbidden(field.NewPath("containers").Index(0).Child("security_context", "capabilities", "add").Index(0), "")},
 	}, {
 		name: "duplicate capability",
 		mutate: func(tmpl *ateapi.ActorTemplate) {
@@ -1178,5 +1189,180 @@ func TestNestedImageStoreBytes(t *testing.T) {
 				t.Errorf("NestedImageStoreBytes(%q) = %d, want %d", tt.in, b, tt.wantB)
 			}
 		})
+	}
+}
+
+// nestedAddCapabilities is the securityContext.capabilities.add list a
+// nested-containers template needs: the nine allowed names beyond the default
+// set plus the three nested-only ones. AUDIT_WRITE, KILL and NET_BIND_SERVICE
+// stay implicit from the default set.
+var nestedAddCapabilities = []string{
+	"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+	"MKNOD", "NET_ADMIN", "SYS_ADMIN",
+}
+
+// withAdd sets container i's capabilities.add, adding containers as needed.
+func withAdd(i int, add ...string) func(*ateapi.ActorTemplate) {
+	return func(tmpl *ateapi.ActorTemplate) {
+		for len(tmpl.Containers) <= i {
+			c := proto.Clone(tmpl.Containers[0]).(*ateapi.Container)
+			c.Name = fmt.Sprintf("c%d", len(tmpl.Containers))
+			c.SecurityContext = nil
+			tmpl.Containers = append(tmpl.Containers, c)
+		}
+		tmpl.Containers[i].SecurityContext = &ateapi.SecurityContext{Capabilities: &ateapi.Capabilities{Add: add}}
+	}
+}
+
+func withNested(tmpl *ateapi.ActorTemplate) {
+	tmpl.Runtime = &ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true}}
+}
+
+func addPath(ctr, idx int) *field.Path {
+	return field.NewPath("actor_template", "containers").Index(ctr).Child("security_context", "capabilities", "add").Index(idx)
+}
+
+// assertNestedForbidden checks errs is exactly the nested-only Forbidden error
+// for each path, with a detail that names the opt-in.
+func assertNestedForbidden(t *testing.T, errs field.ErrorList, paths ...*field.Path) {
+	t.Helper()
+	var want field.ErrorList
+	for _, p := range paths {
+		want = append(want, field.Forbidden(p, ""))
+	}
+	assertValidateErr(t, errs, want)
+	for _, e := range errs {
+		if !strings.Contains(e.Detail, "runtime.nested_containers.enabled") {
+			t.Errorf("error %q does not name runtime.nested_containers.enabled", e.Error())
+		}
+	}
+}
+
+// TestNestedContainersAddCapabilities proves, through both ActorTemplate
+// validation entry points, that MKNOD, NET_ADMIN and SYS_ADMIN are admitted in
+// capabilities.add only with runtime.nested_containers.enabled, and that the
+// opt-in admits nothing else.
+func TestNestedContainersAddCapabilities(t *testing.T) {
+	type entry struct {
+		name     string
+		validate func(*ateapi.ActorTemplate) field.ErrorList
+		// fieldRules is false where the generated per-field rules ratchet
+		// (an update whose containers are unchanged) and so cannot reject.
+		fieldRules bool
+	}
+	entries := []entry{
+		{"CreateActorTemplateRequest", func(tmpl *ateapi.ActorTemplate) field.ErrorList {
+			return ValidateCreateActorTemplateRequest(context.Background(), &ateapi.CreateActorTemplateRequest{ActorTemplate: tmpl})
+		}, true},
+		{"ActorTemplateUpdate", func(tmpl *ateapi.ActorTemplate) field.ErrorList {
+			// As ServiceImpl.CreateActorTemplate calls it: the stored object
+			// differs from the request's only in its status, so the generated
+			// container rules ratchet and the nested-only check must still run.
+			stored := proto.Clone(tmpl).(*ateapi.ActorTemplate)
+			stored.Status = &ateapi.ActorTemplateStatus{}
+			return ValidateActorTemplateUpdate(context.Background(), field.NewPath("actor_template"), stored, tmpl)
+		}, false},
+		{"Validate_ActorTemplate", func(tmpl *ateapi.ActorTemplate) field.ErrorList {
+			// The generated type validator alone, without any request wrapper.
+			return Validate_ActorTemplate(context.Background(), MakeCreateOp(context.Background()), field.NewPath("actor_template"), tmpl, nil)
+		}, true},
+	}
+	for _, ep := range entries {
+		t.Run(ep.name, func(t *testing.T) {
+			for _, gate := range []string{"", string(preview.GateNestedContainers)} {
+				for _, c := range []string{"MKNOD", "NET_ADMIN", "SYS_ADMIN"} {
+					t.Run("nested off forbids "+c+" gate="+gate, func(t *testing.T) {
+						setPreviewForTest(t, gate)
+						assertNestedForbidden(t, ep.validate(validActorTemplate(withAdd(0, "CHOWN", c))), addPath(0, 1))
+					})
+				}
+			}
+			t.Run("nested off forbids each one in every container", func(t *testing.T) {
+				setPreviewForTest(t, string(preview.GateNestedContainers))
+				tmpl := validActorTemplate(withAdd(0, nestedAddCapabilities...), withAdd(1, "SYS_ADMIN"))
+				assertNestedForbidden(t, ep.validate(tmpl), addPath(0, 9), addPath(0, 10), addPath(0, 11), addPath(1, 0))
+			})
+			t.Run("nested off: every allowed name still passes (no compatibility break)", func(t *testing.T) {
+				setPreviewForTest(t, "")
+				assertValidateErr(t, ep.validate(validActorTemplate(withAdd(0, sets.List(resources.AllowedAddCapabilities)...))), nil)
+			})
+			t.Run("nested on admits the nested-containers list", func(t *testing.T) {
+				setPreviewForTest(t, string(preview.GateNestedContainers))
+				assertValidateErr(t, ep.validate(validActorTemplate(withNested, withAdd(0, nestedAddCapabilities...), withAdd(1, "MKNOD"))), nil)
+				all := append(sets.List(resources.AllowedAddCapabilities), "MKNOD", "NET_ADMIN", "SYS_ADMIN")
+				assertValidateErr(t, ep.validate(validActorTemplate(withNested, withAdd(0, all...))), nil)
+			})
+			for _, tc := range []struct {
+				c    string
+				want *field.Error
+			}{
+				{"NET_RAW", field.NotSupported[string](addPath(0, 0), nil, nil)},
+				{"SYS_PTRACE", field.NotSupported[string](addPath(0, 0), nil, nil)},
+				{"SYS_MODULE", field.NotSupported[string](addPath(0, 0), nil, nil)},
+				{"NET_ADIMN", field.NotSupported[string](addPath(0, 0), nil, nil)},
+				{"mknod", field.NotSupported[string](addPath(0, 0), nil, nil)},
+				{"ALL", field.Invalid(addPath(0, 0), nil, "")},
+				{"CAP_SYS_ADMIN", field.Invalid(addPath(0, 0), nil, "")},
+			} {
+				t.Run("nested on still rejects "+tc.c, func(t *testing.T) {
+					if !ep.fieldRules {
+						t.Skip("the generated field rules ratchet on this entry point")
+					}
+					setPreviewForTest(t, string(preview.GateNestedContainers))
+					assertValidateErr(t, ep.validate(validActorTemplate(withNested, withAdd(0, tc.c))), field.ErrorList{tc.want})
+				})
+			}
+		})
+	}
+	// enabled implies the gate: with the gate off the opt-in itself is
+	// forbidden, so a template that sets it to admit SYS_ADMIN is rejected.
+	t.Run("nested on with the gate off is rejected", func(t *testing.T) {
+		setPreviewForTest(t, "")
+		req := &ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(withNested, withAdd(0, "SYS_ADMIN"))}
+		assertValidateErr(t, ValidateCreateActorTemplateRequest(context.Background(), req),
+			field.ErrorList{field.Forbidden(field.NewPath("actor_template", "runtime", "nested_containers"), "")})
+	})
+}
+
+// TestAddCapabilitiesEveryLinuxNameAtAdmission walks all 41 Linux capability
+// names through CreateActorTemplateRequest: without the opt-in exactly the 12
+// allowed names pass, with it exactly those and MKNOD, NET_ADMIN, SYS_ADMIN.
+func TestAddCapabilitiesEveryLinuxNameAtAdmission(t *testing.T) {
+	names := []string{
+		"CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID",
+		"KILL", "SETGID", "SETUID", "SETPCAP", "LINUX_IMMUTABLE",
+		"NET_BIND_SERVICE", "NET_BROADCAST", "NET_ADMIN", "NET_RAW", "IPC_LOCK",
+		"IPC_OWNER", "SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT", "SYS_PTRACE",
+		"SYS_PACCT", "SYS_ADMIN", "SYS_BOOT", "SYS_NICE", "SYS_RESOURCE",
+		"SYS_TIME", "SYS_TTY_CONFIG", "MKNOD", "LEASE", "AUDIT_WRITE",
+		"AUDIT_CONTROL", "SETFCAP", "MAC_OVERRIDE", "MAC_ADMIN", "SYSLOG",
+		"WAKE_ALARM", "BLOCK_SUSPEND", "AUDIT_READ", "PERFMON", "BPF",
+		"CHECKPOINT_RESTORE",
+	}
+	base := sets.New("AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
+		"NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT")
+	nested := base.Union(sets.New("MKNOD", "NET_ADMIN", "SYS_ADMIN"))
+	setPreviewForTest(t, string(preview.GateNestedContainers))
+	var gotOff, gotOn []string
+	for _, c := range names {
+		off := validActorTemplate(withAdd(0, c))
+		if len(ValidateCreateActorTemplateRequest(context.Background(), &ateapi.CreateActorTemplateRequest{ActorTemplate: off})) == 0 {
+			gotOff = append(gotOff, c)
+		}
+		on := validActorTemplate(withNested, withAdd(0, c))
+		if len(ValidateCreateActorTemplateRequest(context.Background(), &ateapi.CreateActorTemplateRequest{ActorTemplate: on})) == 0 {
+			gotOn = append(gotOn, c)
+		}
+	}
+	slices.Sort(gotOff)
+	slices.Sort(gotOn)
+	if len(names) != 41 || sets.New(names...).Len() != 41 {
+		t.Fatalf("names has %d entries, want 41 distinct", len(names))
+	}
+	if want := sets.List(base); !slices.Equal(gotOff, want) {
+		t.Errorf("nested off accepts %v, want exactly %v", gotOff, want)
+	}
+	if want := sets.List(nested); !slices.Equal(gotOn, want) {
+		t.Errorf("nested on accepts %v, want exactly %v", gotOn, want)
 	}
 }
