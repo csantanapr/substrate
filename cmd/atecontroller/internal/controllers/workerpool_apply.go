@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 
@@ -95,6 +96,71 @@ type workerOTelSettings struct {
 
 // workerPoolLabel names the WorkerPool on each of its worker pods.
 const workerPoolLabel = "ate.dev/worker-pool"
+
+// workerTransportLabel marks a worker pod's transport. The node atelet's
+// network-worker directory admits a worker only if its pod carries this label
+// set to workerTransportNetwork; it is reserved to controllers (the
+// WorkerPoolPodTemplate validation rejects ate.dev/ keys), so only this
+// controller sets it, and only for a pool that opted into network transport.
+const (
+	workerTransportLabel   = "ate.dev/worker-transport"
+	workerTransportNetwork = "network"
+)
+
+// guestUsernsInitContainerName names the one-shot initContainer a network
+// worker pod runs before the worker to raise the guest's
+// user.max_user_namespaces so gVisor's sandbox can create its user namespace.
+// Reused as the idempotency key: a second apply removes any existing
+// initContainer with this name before adding, so it is never duplicated.
+const guestUsernsInitContainerName = "guest-userns"
+
+// guestUsernsSetupArg is the worker flag that selects the binary's one-shot
+// guest-userns setup mode (cmd/ateworker-gvisor/guestuserns.go). The
+// initContainer runs the SAME worker image with only this arg; the worker
+// container is never given it.
+const guestUsernsSetupArg = "--setup-guest-userns"
+
+// Network-worker transport install contract. These match the
+// atelet's own defaults (cmd/atelet/network_worker.go: --network-worker-port
+// 8086, --worker-services-listen-address :8087) and the atelet-workers
+// ClusterIP Service that the deployment adds in front of atelet's
+// networked WorkerSupport listener. The controller tells a network worker to
+// serve on networkWorkerListenPort and to reach atelet on the atelet-workers
+// Service in the install's own namespace -- the namespace is systemNamespace,
+// never hard-coded, so a relocated install still points the worker at the
+// right atelet. The Service name and the two ports are the fixed install
+// contract shared with the atelet flags and the Service manifest.
+const (
+	// networkWorkerListenPort is the TCP port a network worker serves its
+	// Worker and WorkerStaging services on. atelet dials it (its
+	// --network-worker-port default is the same value).
+	networkWorkerListenPort = 8086
+	// ateletWorkersServiceName and ateletWorkersServicePort name the ClusterIP
+	// Service in front of atelet's networked WorkerSupport listener
+	// (--worker-services-listen-address :8087). A network worker dials
+	// <service>.<systemNamespace>.svc:<port>.
+	ateletWorkersServiceName = "atelet-workers"
+	ateletWorkersServicePort = 8087
+)
+
+// networkWorkerArgs returns the worker flags that turn on the worker's network
+// mode for a pool that opted into network transport: the local TCP listen
+// address and the atelet-workers Service endpoint. The worker binds a wildcard
+// listener on networkWorkerListenPort (atelet dials the worker Pod's IP; the
+// pool's NetworkPolicy narrows who can connect and mTLS gates the caller,
+// never the bind) and dials atelet at the Service in the install's namespace.
+func networkWorkerArgs(systemNamespace string) []string {
+	return []string{
+		fmt.Sprintf("--worker-listen-address=0.0.0.0:%d", networkWorkerListenPort),
+		fmt.Sprintf("--atelet-address=%s.%s.svc:%d", ateletWorkersServiceName, systemNamespace, ateletWorkersServicePort),
+	}
+}
+
+// ateBaseVolume is the shared node-filesystem hostPath volume (mounted at
+// nodepath.BasePath) a colocated worker reaches the atelet's Unix sockets and
+// the sandbox-runtimes file through. A network worker runs in a separate guest
+// Pod with no shared node filesystem, so applyNetworkTransport removes it.
+const ateBaseVolume = "ate-base"
 
 const (
 	atunnelIdentityVolume       = "atunnel-identity"
@@ -196,7 +262,7 @@ func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, s
 				WithMountPath(workercapacity.MountPath).
 				WithReadOnly(true),
 			corev1ac.VolumeMount().
-				WithName("ate-base").
+				WithName(ateBaseVolume).
 				WithMountPath(nodepath.BasePath).
 				WithMountPropagation(corev1.MountPropagationHostToContainer),
 			corev1ac.VolumeMount().
@@ -222,7 +288,7 @@ func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, s
 						resourceFieldRefFile(workercapacity.MemoryLimitFile, "limits.memory", wholeBytes),
 					)),
 			corev1ac.Volume().
-				WithName("ate-base").
+				WithName(ateBaseVolume).
 				WithHostPath(corev1ac.HostPathVolumeSource().
 					WithPath(nodepath.BasePath).
 					WithType(corev1.HostPathDirectoryOrCreate)),
@@ -260,6 +326,7 @@ func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, s
 	applyWorkerPoolPodTemplate(podSpecAC, containerAC, wp.Spec.Template)
 	applySandboxClassToleration(podSpecAC, wp.Spec.DefaultSandboxClass())
 	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.DefaultSandboxClass())
+	applyNetworkTransport(podSpecAC, containerAC, labels, wp.Spec.NetworkTransport, systemNamespace)
 	podSpecAC.WithContainers(containerAC)
 	podSpecAC.WithTerminationGracePeriodSeconds(workerTerminationGracePeriodSeconds)
 
@@ -395,6 +462,30 @@ func fieldRefEnv(name, fieldPath string) *corev1ac.EnvVarApplyConfiguration {
 var workerGvisorCapabilities = []corev1.Capability{
 	"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE",
 	"FOWNER", "CHOWN", "NET_RAW", "SETFCAP",
+}
+
+// netBindServiceCapability lets a process bind a privileged port (<1024) as a
+// non-root or capability-limited process. A network worker needs it to bind
+// atunnel on :443 inside a guest runtime class that does not set
+// net.ipv4.ip_unprivileged_port_start=0. Added only by applyNetworkTransport,
+// so it never widens a colocated worker's set.
+const netBindServiceCapability corev1.Capability = "NET_BIND_SERVICE"
+
+// addWorkerCapability appends cap to the worker container's security-context
+// capability Add list if it is not already present. Idempotent: applying the
+// same pod twice does not duplicate the capability. It only touches the Add
+// list, leaving Drop (and every other capability already present) exactly as
+// workerSecurityContext set it. It is a no-op if the container has no security
+// context or capabilities set, which never happens for a worker container the
+// controller builds but keeps the helper total.
+func addWorkerCapability(containerAC *corev1ac.ContainerApplyConfiguration, cap corev1.Capability) {
+	if containerAC.SecurityContext == nil || containerAC.SecurityContext.Capabilities == nil {
+		return
+	}
+	if slices.Contains(containerAC.SecurityContext.Capabilities.Add, cap) {
+		return
+	}
+	containerAC.SecurityContext.Capabilities.Add = append(containerAC.SecurityContext.Capabilities.Add, cap)
 }
 
 // workerMicroVMCapabilities retains virtiofsd's eight default child
@@ -577,6 +668,199 @@ func addDeviceResourceLimits(containerAC *corev1ac.ContainerApplyConfiguration, 
 		limits[corev1.ResourceName(name)] = resource.MustParse("1")
 	}
 	containerAC.Resources.WithLimits(limits)
+}
+
+// applyNetworkTransport shapes a worker pod for network transport: it runs in a
+// separate guest Pod reached over authenticated Pod networking instead of the
+// node's shared filesystem. No-op when nt is nil, so a colocated pool's pod is
+// byte-for-byte unchanged.
+//
+// When nt is set it:
+//   - gives the pod the configured RuntimeClass, so it can be placed on an
+//     isolating guest runtime class;
+//   - adds the reserved ate.dev/worker-transport=network label the node atelet's
+//     network-worker directory authorizes a network worker by (into labels,
+//     which the caller puts on the Deployment and the pod template but NOT the
+//     immutable selector);
+//   - replaces the shared node-filesystem hostPath volume and its mount, which
+//     a separate guest cannot and must not use, with a writable emptyDir at the
+//     same path so the worker has a real (non-overlayfs) filesystem to MkdirAll
+//     its subtree and mount per-container overlay rootfs upperdirs under.
+//
+// The service account is left as applyWorkerPoolPodTemplate set it (the install
+// default "ateworker", or the pool's own ServiceAccountName): network transport
+// does not change the worker's identity. atelet, however, admits a network
+// worker only if it runs as the one account its --network-worker-service-account
+// flag names (default "ateworker"), so a network pool whose template sets
+// another serviceAccountName is not rejected here but its workers cannot
+// authenticate to atelet.
+//
+// It passes the worker-side network flags (--worker-listen-address and
+// --atelet-address) so the worker binary serves its lifecycle and staging
+// services over TCP mTLS and dials WorkerSupport over the atelet-workers
+// Service. These flags are only ever passed to a pool that opted in, so a
+// colocated worker never receives a flag it does not parse.
+func applyNetworkTransport(
+	podSpecAC *corev1ac.PodSpecApplyConfiguration,
+	containerAC *corev1ac.ContainerApplyConfiguration,
+	labels map[string]string,
+	nt *atev1.WorkerPoolNetworkTransport,
+	systemNamespace string,
+) {
+	if nt == nil {
+		return
+	}
+
+	podSpecAC.WithRuntimeClassName(nt.RuntimeClassName)
+
+	// Turn on the worker's network mode. WithArgs appends, so these follow the
+	// base args already set on the container. Only a network pool reaches here,
+	// so a colocated worker never sees these flags.
+	containerAC.WithArgs(networkWorkerArgs(systemNamespace)...)
+
+	// A network worker binds atunnel on :443, a privileged port. A colocated
+	// worker relies on the node's containerd setting net.ipv4.ip_unprivileged_port_start=0 for
+	// the pod (enable_unprivileged_ports), so uid 0 binds :443 without a
+	// capability. An isolating guest runtime class does not honor that
+	// containerd default, so inside the guest even uid 0 is refused with
+	// "listen tcp :443: bind: permission denied" and the worker crash-loops.
+	// Grant NET_BIND_SERVICE so the privileged bind is permitted regardless of
+	// the sysctl. Only a network pool reaches here, so a colocated worker's
+	// capability set is unchanged. Idempotent: never add a duplicate, and leave
+	// drop:[ALL] and every other capability exactly as workerSecurityContext set
+	// them.
+	addWorkerCapability(containerAC, netBindServiceCapability)
+
+	// Reserved to controllers; this is the only writer, and only for a pool
+	// that opted in. It identifies a network worker to the node directory.
+	labels[workerTransportLabel] = workerTransportNetwork
+
+	// A separate guest shares no node filesystem: the shared node hostPath
+	// cannot and must not be reached. But the worker still needs a WRITABLE
+	// directory at nodepath.BasePath that is NOT the container's own overlayfs:
+	// it MkdirAlls its subtree there (workers/, actors/) and, crucially, mounts
+	// a per-container overlay rootfs with its upperdir under
+	// <BasePath>/actors/<uid>/bundles/<c>/upper
+	// (internal/imagecache/bundle_linux.go). The failure to avoid is precisely
+	// that upperdir landing on the container's OWN overlayfs root -- the kernel
+	// refuses an overlay whose upperdir sits on another overlayfs -- so the
+	// pause-container rootfs mount failed with
+	// "filesystem on ... not supported as upperdir".
+	//
+	// Replace the hostPath with an emptyDir of the DEFAULT medium, mounted at
+	// the same path. By the Kubernetes contract a default-medium emptyDir uses
+	// the storage backing the kubelet root directory rather than a tmpfs
+	// (medium Memory). That alone does NOT guarantee a filesystem distinct from
+	// the container's overlay layer -- default storage may be disk, SSD or
+	// network-backed, and the API promises no separate superblock. The
+	// separation this fix relies on is a runtime fact of the sandbox: in this guest the
+	// emptyDir is replicated as a plain directory under the guest root
+	// filesystem (so the upperdir stays out of the container's own overlay
+	// mount), and the live sandbox-runtime re-proof confirms that
+	// backing supports the overlay upperdir. We do NOT claim overlayfs rejects
+	// a tmpfs upperdir (current kernels accept one); we require the default
+	// (non-Memory) medium only to keep the backing off a tmpfs shape we have no
+	// reason to introduce and have not proven. No sizeLimit: runtime assets,
+	// image layers
+	// and actor state all land here, and a small cap would evict them mid-actor;
+	// the guest's own disk pressure bounds it. The worker runs as uid 0
+	// (podSecurityContext RunAsUser/RunAsGroup 0, set in the base builder), so
+	// it can write the emptyDir root (0777, root) and MkdirAll every subdirectory
+	// it needs -- the same empty starting point a fresh node's
+	// HostPathDirectoryOrCreate would give a colocated worker.
+	//
+	// Done as remove-then-add so a second apply over the same config does not
+	// duplicate the volume or the mount: DeleteFunc strips any existing ate-base
+	// (hostPath on the first pass, emptyDir on a second), then exactly one
+	// emptyDir volume and one mount are appended. Only a network pool reaches
+	// here, so a colocated worker keeps its hostPath untouched.
+	podSpecAC.Volumes = slices.DeleteFunc(podSpecAC.Volumes, func(v corev1ac.VolumeApplyConfiguration) bool {
+		return v.Name != nil && *v.Name == ateBaseVolume
+	})
+	containerAC.VolumeMounts = slices.DeleteFunc(containerAC.VolumeMounts, func(m corev1ac.VolumeMountApplyConfiguration) bool {
+		return m.Name != nil && *m.Name == ateBaseVolume
+	})
+	podSpecAC.WithVolumes(
+		corev1ac.Volume().
+			WithName(ateBaseVolume).
+			WithEmptyDir(corev1ac.EmptyDirVolumeSource()),
+	)
+	containerAC.WithVolumeMounts(
+		corev1ac.VolumeMount().
+			WithName(ateBaseVolume).
+			WithMountPath(nodepath.BasePath),
+	)
+
+	// A network worker runs in an isolating guest, and some guest kernels ship
+	// with user.max_user_namespaces=0. gVisor's sentry is started in a NEW user
+	// namespace for sandbox networking, so such a guest refuses the clone and the
+	// sandbox dies at startup. Prepend a one-shot initContainer that raises the
+	// sysctl inside the pod's own guest before the worker starts. The worker
+	// container's own capabilities and security context are left exactly as
+	// workerSecurityContext (+ NET_BIND_SERVICE above) set them: SYS_RESOURCE is
+	// added ONLY to this short-lived initContainer, never to the worker.
+	applyGuestUsernsInitContainer(podSpecAC, containerAC)
+}
+
+// applyGuestUsernsInitContainer prepends (idempotently) the one-shot
+// guest-userns initContainer to a network worker's pod. It runs the SAME image
+// as the worker container (read from containerAC at this point, after the base
+// builder set it from wp.Spec.WorkerImage) so the one-shot code and the worker
+// are the same binary, and args are just the one-shot flag. Its security
+// context drops ALL capabilities and adds SYS_ADMIN (to remount the guest's
+// read-only /proc/sys) and SYS_RESOURCE (which CAP_SYS_RESOURCE in the user
+// namespace lets the kernel honor for user.* sysctls) ONLY -- nothing else, and
+// never privileged. It matches the worker's seccomp/AppArmor Unconfined because
+// the remount trips the default AppArmor profile exactly as the worker's own
+// mounts do (see workerSecurityContext); without that match the remount would be
+// denied on a node that loads AppArmor.
+//
+// Idempotent, as the volume handling is: a second apply over the same
+// config first removes any existing initContainer with this name, then appends
+// exactly one, so re-applying never duplicates it.
+func applyGuestUsernsInitContainer(
+	podSpecAC *corev1ac.PodSpecApplyConfiguration,
+	containerAC *corev1ac.ContainerApplyConfiguration,
+) {
+	// Use the worker container's own image so the one-shot is the same binary.
+	// The base builder sets it (WithImage(wp.Spec.WorkerImage)) before
+	// applyNetworkTransport runs, so it is always present here. A nil image means
+	// the builder was reordered and this helper now runs before the image is
+	// set: fail fast rather than silently emit an empty image (which would
+	// produce a pod the API rejects, far from the cause). This is an internal
+	// invariant of the builder, not operator input, so a panic is the right
+	// signal -- it is unreachable in a correctly ordered builder and a test
+	// (TestGuestUsernsInitContainerPresentOnNetworkPod) exercises the real order.
+	if containerAC.Image == nil {
+		panic("applyGuestUsernsInitContainer: worker container image is not set; it must run after the base builder sets WithImage")
+	}
+	image := *containerAC.Image
+
+	init := corev1ac.Container().
+		WithName(guestUsernsInitContainerName).
+		WithImage(image).
+		WithArgs(guestUsernsSetupArg).
+		WithResources(corev1ac.ResourceRequirements().
+			WithRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("16Mi"),
+			})).
+		WithSecurityContext(corev1ac.SecurityContext().
+			WithRunAsUser(0).
+			WithRunAsGroup(0).
+			WithPrivileged(false).
+			WithCapabilities(corev1ac.Capabilities().
+				WithDrop("ALL").
+				WithAdd("SYS_ADMIN", "SYS_RESOURCE")).
+			WithAppArmorProfile(corev1ac.AppArmorProfile().
+				WithType(corev1.AppArmorProfileTypeUnconfined)).
+			WithSeccompProfile(corev1ac.SeccompProfile().
+				WithType(corev1.SeccompProfileTypeUnconfined)))
+
+	podSpecAC.InitContainers = slices.DeleteFunc(podSpecAC.InitContainers, func(c corev1ac.ContainerApplyConfiguration) bool {
+		return c.Name != nil && *c.Name == guestUsernsInitContainerName
+	})
+	podSpecAC.WithInitContainers(init)
 }
 
 func applyWorkerPoolPodTemplate(

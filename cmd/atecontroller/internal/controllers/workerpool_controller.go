@@ -41,6 +41,7 @@ import (
 	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"go.ate.dev/substrate/internal/ateattr"
 	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/preview"
 )
 
 const (
@@ -163,6 +164,13 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
 	log := log.FromContext(ctx)
 	log.Info("Reconciling worker pool")
 
+	// networkTransport is a preview feature, off unless the gate is enabled.
+	// The CRD has no admission webhook, so the gate is enforced here, in the
+	// controller that reads the field. See networkTransportGateError.
+	if err := networkTransportGateError(wp); err != nil {
+		return err
+	}
+
 	existing := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, existing); err != nil {
 		if !k8errors.IsNotFound(err) {
@@ -208,6 +216,27 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
 	// a config.
 	if existing == nil && everyClassHasConfig(classes) {
 		return r.applyDeployment(ctx, wp)
+	}
+	return nil
+}
+
+// networkTransportGateError reports why a pool may not be reconciled because
+// of the NetworkWorkers preview gate, or nil when it may.
+//
+// networkTransport is off unless the gate is enabled. The controller acts on
+// the system's behalf (its reconcile context never went through the API opt-in
+// interceptor), so a process-level gate check is the right form here, not the
+// request-scoped preview.IsEnabledFor. With the gate off, a pool that sets
+// networkTransport is rejected and no worker Deployment is applied from it,
+// rather than silently running colocated workers under a shape the pool did not
+// ask for. A pool that leaves networkTransport unset returns nil regardless of
+// the gate, so the gate being off never changes an existing colocated pool.
+//
+// It is the sole decider of this gate, so the reconciler reaches the field only
+// through it; a unit test exercises both gate states against the same field.
+func networkTransportGateError(wp *atev1.WorkerPool) error {
+	if wp.Spec.NetworkTransport != nil && !preview.IsEnabled(preview.GateNetworkWorkers) {
+		return fmt.Errorf("spec.networkTransport requires the %q preview gate, which is not enabled", preview.GateNetworkWorkers)
 	}
 	return nil
 }

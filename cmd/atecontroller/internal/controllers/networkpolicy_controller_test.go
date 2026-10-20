@@ -19,6 +19,7 @@ import (
 	"slices"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -221,5 +222,50 @@ func TestNetworkPolicyTakeover(t *testing.T) {
 				t.Errorf("NetworkPolicy label %s = %q, want %q", workerPoolLabel, got.Labels[workerPoolLabel], wp.Name)
 			}
 		})
+	}
+}
+
+// TestBuildNetworkPolicyNetworkTransport covers the atelet ingress rule a
+// network pool needs. Its workers serve their Worker and WorkerStaging
+// services on networkWorkerListenPort instead of the node-local socket, so
+// atelet dials them over the Pod network. Without the rule the CNI drops that
+// dial, the worker never stages an activation, and every actor on the pool
+// crashes with no error from the worker itself. A colocated pool must not get
+// the rule, so both directions are pinned here.
+func TestBuildNetworkPolicyNetworkTransport(t *testing.T) {
+	r := &NetworkPolicyReconciler{SystemNamespace: installdefaults.SystemNamespace}
+
+	colocated := r.buildNetworkPolicyApplyConfig(testWorkerPoolApplyConfig(nil))
+	if len(colocated.Spec.Ingress) != 1 {
+		t.Errorf("colocated pool ingress rules = %d, want 1 (router only)", len(colocated.Spec.Ingress))
+	}
+
+	wp := testWorkerPoolApplyConfig(nil)
+	wp.Spec.NetworkTransport = &atev1.WorkerPoolNetworkTransport{RuntimeClassName: "kata"}
+	np := r.buildNetworkPolicyApplyConfig(wp)
+
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("network pool ingress rules = %d, want 2 (router and atelet), got %+v", len(np.Spec.Ingress), np.Spec.Ingress)
+	}
+	atelet := np.Spec.Ingress[1]
+	if len(atelet.From) != 1 {
+		t.Fatalf("atelet rule peers = %d, want 1", len(atelet.From))
+	}
+	if got := atelet.From[0].PodSelector.MatchLabels["app"]; got != ateletAppName {
+		t.Errorf("atelet rule pod selector app = %q, want %q", got, ateletAppName)
+	}
+	if got := atelet.From[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"]; got != installdefaults.SystemNamespace {
+		t.Errorf("atelet rule namespace selector = %q, want %q", got, installdefaults.SystemNamespace)
+	}
+	// The port is the contract networkWorkerArgs builds --worker-listen-address
+	// from; widening the rule to every port would expose atunnel on :443 too.
+	if len(atelet.Ports) != 1 {
+		t.Fatalf("atelet rule ports = %d, want 1", len(atelet.Ports))
+	}
+	if got := atelet.Ports[0].Port.IntValue(); got != networkWorkerListenPort {
+		t.Errorf("atelet rule port = %d, want %d", got, networkWorkerListenPort)
+	}
+	if got := atelet.Ports[0].Protocol; got == nil || *got != corev1.ProtocolTCP {
+		t.Errorf("atelet rule protocol = %v, want TCP", got)
 	}
 }

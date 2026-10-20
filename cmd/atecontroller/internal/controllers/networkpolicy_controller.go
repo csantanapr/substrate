@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	networkingv1ac "k8s.io/client-go/applyconfigurations/networking/v1"
 	"k8s.io/client-go/tools/events"
@@ -38,6 +39,7 @@ import (
 const (
 	networkPolicyFieldOwner = "ate-networkpolicy"
 	atenetRouterAppName     = "atenet-router"
+	ateletAppName           = "atelet"
 	// eventReasonNetworkPolicyConflict is the reason of the Warning event a
 	// pool emits when checkNetworkPolicyOwner refuses its NetworkPolicy.
 	eventReasonNetworkPolicyConflict = "NetworkPolicyConflict"
@@ -150,22 +152,44 @@ func (r *NetworkPolicyReconciler) buildNetworkPolicyApplyConfig(wp *atev1.Worker
 			WithController(true).
 			WithBlockOwnerDeletion(true))
 
-	// Ingress policy: only accept connections from the atenet-router, all ports.
+	// Ingress policy: accept connections from the atenet-router on all ports
+	// and, for a network pool only, from atelet on the worker listen port.
+	ingress := []*networkingv1ac.NetworkPolicyIngressRuleApplyConfiguration{
+		networkingv1ac.NetworkPolicyIngressRule().
+			WithFrom(
+				networkingv1ac.NetworkPolicyPeer().
+					WithNamespaceSelector(metav1ac.LabelSelector().
+						WithMatchLabels(map[string]string{"kubernetes.io/metadata.name": r.SystemNamespace})).
+					WithPodSelector(metav1ac.LabelSelector().
+						WithMatchLabels(map[string]string{"app": atenetRouterAppName})),
+			),
+	}
+	// A network pool's workers run in their own Pod, so atelet reaches their
+	// Worker and WorkerStaging services over the Pod network instead of the
+	// node-local socket. Admit atelet on that one port only; the router rule
+	// above already covers the router, and no other peer is added.
+	if wp.Spec.NetworkTransport != nil {
+		ingress = append(ingress, networkingv1ac.NetworkPolicyIngressRule().
+			WithFrom(
+				networkingv1ac.NetworkPolicyPeer().
+					WithNamespaceSelector(metav1ac.LabelSelector().
+						WithMatchLabels(map[string]string{"kubernetes.io/metadata.name": r.SystemNamespace})).
+					WithPodSelector(metav1ac.LabelSelector().
+						WithMatchLabels(map[string]string{"app": ateletAppName})),
+			).
+			WithPorts(
+				networkingv1ac.NetworkPolicyPort().
+					WithProtocol(corev1.ProtocolTCP).
+					WithPort(intstr.FromInt32(networkWorkerListenPort)),
+			))
+	}
+
 	np.
 		WithSpec(networkingv1ac.NetworkPolicySpec().
 			WithPodSelector(metav1ac.LabelSelector().
 				WithMatchLabels(map[string]string{"ate.dev/worker-pool": wp.Name})).
 			WithPolicyTypes(networkingv1.PolicyTypeIngress).
-			WithIngress(
-				networkingv1ac.NetworkPolicyIngressRule().
-					WithFrom(
-						networkingv1ac.NetworkPolicyPeer().
-							WithNamespaceSelector(metav1ac.LabelSelector().
-								WithMatchLabels(map[string]string{"kubernetes.io/metadata.name": r.SystemNamespace})).
-							WithPodSelector(metav1ac.LabelSelector().
-								WithMatchLabels(map[string]string{"app": atenetRouterAppName})),
-					),
-			))
+			WithIngress(ingress...))
 
 	// Egress is left unmanaged by Kubernetes NetworkPolicy for now while waiting for
 	// further progress on Egress API designs and because some egress rules may not be
