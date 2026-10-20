@@ -233,9 +233,56 @@ func TestValidateCreateActorTemplateRequest(t *testing.T) {
 			field.Required(field.NewPath("actor_template", "resources", "limits", "cpu_millicores"), ""),
 			field.Required(field.NewPath("actor_template", "resources", "limits", "memory_bytes"), ""),
 		},
+	}, {
+		// A nested-containers opt-in is accepted on the gVisor fixture,
+		// enabled-only and enabled+write+size.
+		"nested enabled only",
+		&ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapi.ActorTemplate) {
+			tmpl.Runtime = &ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true}}
+		})},
+		nil,
+	}, {
+		"nested enabled with write and size",
+		&ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapi.ActorTemplate) {
+			tmpl.Runtime = &ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true, PacketSocketWrite: true, ImageStoreSize: "1Gi"}}
+		})},
+		nil,
+	}, {
+		// packet_socket_write requires enabled.
+		"nested packet_socket_write without enabled",
+		&ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapi.ActorTemplate) {
+			tmpl.Runtime = &ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{PacketSocketWrite: true}}
+		})},
+		field.ErrorList{field.Forbidden(field.NewPath("actor_template", "runtime", "nested_containers", "packet_socket_write"), "")},
+	}, {
+		// image_store_size requires enabled.
+		"nested image_store_size without enabled",
+		&ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapi.ActorTemplate) {
+			tmpl.Runtime = &ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{ImageStoreSize: "512Mi"}}
+		})},
+		field.ErrorList{field.Forbidden(field.NewPath("actor_template", "runtime", "nested_containers", "image_store_size"), "")},
+	}, {
+		// A user volume mounted at the nested image store is refused.
+		"nested with volume mount overlapping the image store",
+		&ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapi.ActorTemplate) {
+			tmpl.Runtime = &ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true}}
+			tmpl.Volumes = []*ateapi.Volume{{Name: "data", DurableDir: &ateapi.DurableDirVolumeSource{}}}
+			tmpl.Containers[0].VolumeMounts = []*ateapi.VolumeMount{{Name: "data", MountPath: "/var/lib/docker"}}
+		})},
+		field.ErrorList{field.Invalid(field.NewPath("actor_template", "containers").Index(0).Child("volume_mounts").Index(0).Child("mount_path"), "/var/lib/docker", "")},
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// The nested-containers field is a preview feature, so its inner
+			// rules (packet_socket_write/image_store_size require enabled, the
+			// image-store mount collision) are only reachable with the gate on.
+			// Enable it for those cases; the gate-off rejection is proved
+			// separately by TestNestedContainersPreviewGate.
+			if strings.HasPrefix(tt.name, "nested ") {
+				setPreviewForTest(t, string(preview.GateNestedContainers))
+				assertValidateErr(t, ValidateCreateActorTemplateRequest(context.Background(), tt.req), tt.want)
+				return
+			}
 			want := tt.want
 			var wantWithPreview map[string]field.ErrorList
 			if tt.req.GetActorTemplate().GetGoldenEgressPolicy() != nil {
@@ -251,6 +298,39 @@ func TestValidateCreateActorTemplateRequest(t *testing.T) {
 			}, want, wantWithPreview)
 		})
 	}
+}
+
+// TestNestedContainersPreviewGate proves the runtime.nested_containers field is
+// gated by the NestedContainers preview gate: forbidden when the gate is off,
+// accepted when it is on, and byte-for-byte unaffected for a template that does
+// not set it. It mirrors the gate's two switches: the process-level gate
+// (setPreviewForTest) and the request opt-out (preview.ContextWithOptOut).
+func TestNestedContainersPreviewGate(t *testing.T) {
+	nestedReq := func() *ateapi.CreateActorTemplateRequest {
+		return &ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate(func(tmpl *ateapi.ActorTemplate) {
+			tmpl.Runtime = &ateapi.RuntimeConfig{NestedContainers: &ateapi.NestedContainersConfig{Enabled: true}}
+		})}
+	}
+	forbidden := field.ErrorList{field.Forbidden(field.NewPath("actor_template", "runtime", "nested_containers"), "")}
+
+	t.Run("gate off: nested_containers is forbidden", func(t *testing.T) {
+		setPreviewForTest(t, "")
+		assertValidateErr(t, ValidateCreateActorTemplateRequest(context.Background(), nestedReq()), forbidden)
+	})
+	t.Run("gate on: nested_containers is accepted", func(t *testing.T) {
+		setPreviewForTest(t, string(preview.GateNestedContainers))
+		assertValidateErr(t, ValidateCreateActorTemplateRequest(context.Background(), nestedReq()), nil)
+	})
+	t.Run("gate on but request opted out: forbidden", func(t *testing.T) {
+		setPreviewForTest(t, string(preview.GateNestedContainers))
+		ctx := preview.ContextWithOptOut(context.Background())
+		assertValidateErr(t, ValidateCreateActorTemplateRequest(ctx, nestedReq()), forbidden)
+	})
+	t.Run("gate off: a template without the field is unaffected", func(t *testing.T) {
+		setPreviewForTest(t, "")
+		req := &ateapi.CreateActorTemplateRequest{ActorTemplate: validActorTemplate()}
+		assertValidateErr(t, ValidateCreateActorTemplateRequest(context.Background(), req), nil)
+	})
 }
 
 func TestValidateCreateActorTemplateRequest_PreviewRestricted(t *testing.T) {
@@ -1006,4 +1086,97 @@ func validActorTemplate(mutations ...func(*ateapi.ActorTemplate)) *ateapi.ActorT
 		m(template)
 	}
 	return template
+}
+
+// TestValidateCustom_NestedContainersConfig pins the opt-in's dependency and
+// bounds rules directly, both ways, at the boundary values.
+func TestValidateCustom_NestedContainersConfig(t *testing.T) {
+	path := field.NewPath("runtime", "nested_containers")
+	tests := []struct {
+		name string
+		cfg  *ateapi.NestedContainersConfig
+		want field.ErrorList
+	}{
+		{"nil", nil, nil},
+		{"enabled only", &ateapi.NestedContainersConfig{Enabled: true}, nil},
+		{"enabled with min size", &ateapi.NestedContainersConfig{Enabled: true, ImageStoreSize: "64Mi"}, nil},
+		{"enabled with max size", &ateapi.NestedContainersConfig{Enabled: true, ImageStoreSize: "64Gi"}, nil},
+		{"enabled with write", &ateapi.NestedContainersConfig{Enabled: true, PacketSocketWrite: true}, nil},
+		{
+			"write without enabled",
+			&ateapi.NestedContainersConfig{PacketSocketWrite: true},
+			field.ErrorList{field.Forbidden(path.Child("packet_socket_write"), "")},
+		},
+		{
+			"size without enabled",
+			&ateapi.NestedContainersConfig{ImageStoreSize: "128Mi"},
+			field.ErrorList{field.Forbidden(path.Child("image_store_size"), "")},
+		},
+		{
+			"size below the floor",
+			&ateapi.NestedContainersConfig{Enabled: true, ImageStoreSize: "63Mi"},
+			field.ErrorList{field.Invalid(path.Child("image_store_size"), "63Mi", "")},
+		},
+		{
+			"size above the ceiling",
+			&ateapi.NestedContainersConfig{Enabled: true, ImageStoreSize: "65Gi"},
+			field.ErrorList{field.Invalid(path.Child("image_store_size"), "65Gi", "")},
+		},
+		{
+			"size not a whole number of bytes",
+			&ateapi.NestedContainersConfig{Enabled: true, ImageStoreSize: "500m"},
+			field.ErrorList{field.Invalid(path.Child("image_store_size"), "500m", "")},
+		},
+		{
+			"size not a quantity",
+			&ateapi.NestedContainersConfig{Enabled: true, ImageStoreSize: "not-a-size"},
+			field.ErrorList{field.Invalid(path.Child("image_store_size"), "not-a-size", "")},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ValidateCustom_NestedContainersConfig(context.Background(), MakeCreateOp(context.Background()), path, tt.cfg, nil)
+			field.ErrorMatcher{}.ByType().ByField().Test(t, tt.want, got)
+		})
+	}
+}
+
+// TestNestedImageStoreBytes pins the shared parser admission and the ateapi ->
+// atelet plumbing both use, at the boundaries. It checks the returned byte
+// count on the accept cases so a wrong return value is caught,
+// not just that no error was returned.
+func TestNestedImageStoreBytes(t *testing.T) {
+	tests := []struct {
+		in      string
+		wantB   int64
+		wantErr bool
+	}{
+		{"64Mi", 64 << 20, false},
+		{"512Mi", 512 << 20, false},
+		{"64Gi", 64 << 30, false},
+		{"1Gi", 1 << 30, false},
+		{"63Mi", 0, true},       // below the floor
+		{"65Gi", 0, true},       // above the ceiling
+		{"500m", 0, true},       // fraction of a byte, rounds up: not whole
+		{"0.5", 0, true},        // rounds up to 1 byte: not whole and below floor
+		{"not-a-size", 0, true}, // not a quantity
+		{"", 0, true},           // empty is not a quantity here (callers guard "")
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			b, err := NestedImageStoreBytes(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("NestedImageStoreBytes(%q) = (%d, nil), want an error", tt.in, b)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NestedImageStoreBytes(%q) = error %v, want %d", tt.in, err, tt.wantB)
+			}
+			if b != tt.wantB {
+				t.Errorf("NestedImageStoreBytes(%q) = %d, want %d", tt.in, b, tt.wantB)
+			}
+		})
+	}
 }

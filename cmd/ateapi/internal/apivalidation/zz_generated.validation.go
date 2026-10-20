@@ -1454,6 +1454,36 @@ func Validate_ActorTemplate(
 		errs = append(errs, fn(fldPath.Child("status"), obj.Status, oldVal, oldObj != nil)...)
 	}
 
+	{ // field v1.ActorTemplate.Runtime
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *v1.RuntimeConfig,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if ateDeepEqual(obj, oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalPointer(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			// call the type's validation function
+			errs = append(errs, Validate_RuntimeConfig(ctx, op, fldPath, obj, oldObj)...)
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *v1.ActorTemplate) *v1.RuntimeConfig {
+				return oldObj.Runtime
+			})
+		errs = append(errs, fn(fldPath.Child("runtime"), obj.Runtime, oldVal, oldObj != nil)...)
+	}
+
 	return errs
 }
 
@@ -6301,6 +6331,107 @@ func Validate_MintWorkerActorJwtRequest(
 	return errs
 }
 
+// Validate_NestedContainersConfig validates an instance of NestedContainersConfig according
+// to declarative validation rules in the API schema.
+func Validate_NestedContainersConfig(
+	ctx context.Context, op operation.Operation, fldPath *field.Path,
+	obj, oldObj *v1.NestedContainersConfig) (errs field.ErrorList) {
+
+	// custom validation
+	if e := ValidateCustom_NestedContainersConfig(ctx, op, fldPath, obj, oldObj); len(e) != 0 {
+		errs = append(errs, e...)
+	}
+
+	{ // field v1.NestedContainersConfig.Enabled
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *bool,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *v1.NestedContainersConfig) *bool {
+				return &oldObj.Enabled
+			})
+		errs = append(errs, fn(fldPath.Child("enabled"), &obj.Enabled, oldVal, oldObj != nil)...)
+	}
+
+	{ // field v1.NestedContainersConfig.PacketSocketWrite
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *bool,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *v1.NestedContainersConfig) *bool {
+				return &oldObj.PacketSocketWrite
+			})
+		errs = append(errs, fn(fldPath.Child("packet_socket_write"), &obj.PacketSocketWrite, oldVal, oldObj != nil)...)
+	}
+
+	{ // field v1.NestedContainersConfig.ImageStoreSize
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *string,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if obj == oldObj || (obj != nil && oldObj != nil && *obj == *oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.OptionalValue(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			if e := validate.MaxLength(ctx, op, fldPath, obj, oldObj, 32); len(e) != 0 {
+				errs = append(errs, e...)
+			}
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *v1.NestedContainersConfig) *string {
+				return &oldObj.ImageStoreSize
+			})
+		errs = append(errs, fn(fldPath.Child("image_store_size"), &obj.ImageStoreSize, oldVal, oldObj != nil)...)
+	}
+
+	return errs
+}
+
 // Validate_ObjectRef validates an instance of ObjectRef according
 // to declarative validation rules in the API schema.
 func Validate_ObjectRef(
@@ -7573,6 +7704,52 @@ func Validate_RevertActorRequest(
 				return oldObj.Actor
 			})
 		errs = append(errs, fn(fldPath.Child("actor"), obj.Actor, oldVal, oldObj != nil)...)
+	}
+
+	return errs
+}
+
+// Validate_RuntimeConfig validates an instance of RuntimeConfig according
+// to declarative validation rules in the API schema.
+func Validate_RuntimeConfig(
+	ctx context.Context, op operation.Operation, fldPath *field.Path,
+	obj, oldObj *v1.RuntimeConfig) (errs field.ErrorList) {
+
+	{ // field v1.RuntimeConfig.NestedContainers
+		fn := func(
+			fldPath *field.Path,
+			obj, oldObj *v1.NestedContainersConfig,
+			oldValueCorrelated bool) (errs field.ErrorList) {
+			// don't revalidate unchanged data
+			if oldValueCorrelated && op.Type == operation.Update {
+				if ateDeepEqual(obj, oldObj) {
+					return nil
+				}
+			}
+			// call field-attached validations
+			earlyReturn := false
+			if e := validate.IfOption(ctx, op, fldPath, obj, oldObj, "NestedContainers", false, validate.ForbiddenPointer).MarkShortCircuit(); len(e) != 0 {
+				errs = append(errs, e...)
+				earlyReturn = true
+			}
+			if e := validate.IfOption(ctx, op, fldPath, obj, oldObj, "NestedContainers", false, validate.OptionalPointer).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if e := validate.OptionalPointer(ctx, op, fldPath, obj, oldObj).MarkShortCircuit(); len(e) != 0 {
+				earlyReturn = true
+			}
+			if earlyReturn {
+				return // do not proceed
+			}
+			// call the type's validation function
+			errs = append(errs, Validate_NestedContainersConfig(ctx, op, fldPath, obj, oldObj)...)
+			return
+		}
+		oldVal := safe.Field(oldObj,
+			func(oldObj *v1.RuntimeConfig) *v1.NestedContainersConfig {
+				return oldObj.NestedContainers
+			})
+		errs = append(errs, fn(fldPath.Child("nested_containers"), obj.NestedContainers, oldVal, oldObj != nil)...)
 	}
 
 	return errs
