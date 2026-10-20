@@ -39,6 +39,7 @@ const (
 	WorkerSupport_SetWorkerSandboxRuntimes_FullMethodName = "/atelet.WorkerSupport/SetWorkerSandboxRuntimes"
 	WorkerSupport_RequestActorSuspend_FullMethodName      = "/atelet.WorkerSupport/RequestActorSuspend"
 	WorkerSupport_GetActorEgressPolicy_FullMethodName     = "/atelet.WorkerSupport/GetActorEgressPolicy"
+	WorkerSupport_GetSandboxRuntimes_FullMethodName       = "/atelet.WorkerSupport/GetSandboxRuntimes"
 	WorkerSupport_ReportActorCrashed_FullMethodName       = "/atelet.WorkerSupport/ReportActorCrashed"
 )
 
@@ -84,6 +85,19 @@ type WorkerSupportClient interface {
 	// Control.GetActorEgressPolicy. An error is the control plane's, passed
 	// through as it was given.
 	GetActorEgressPolicy(ctx context.Context, in *GetActorEgressPolicyRequest, opts ...grpc.CallOption) (*GetActorEgressPolicyResponse, error)
+	// GetSandboxRuntimes returns the sandbox runtimes atelet keeps for the
+	// calling worker: the default runtime and the restorable runtimes of the
+	// worker's pool's SandboxConfig, the same content atelet writes to the
+	// worker's on-node sandbox runtimes file.
+	//
+	// Colocated workers never call this: they read the file directly off the
+	// shared node filesystem. It exists for a network worker (a separate guest
+	// Pod) that shares no filesystem with atelet and so cannot read that file;
+	// it fetches the runtimes over this call instead and registers them through
+	// RegisterWorker. The worker is identified only by its mTLS certificate,
+	// never by the request, so a worker gets its own pool's runtimes and no
+	// other's.
+	GetSandboxRuntimes(ctx context.Context, in *GetSandboxRuntimesRequest, opts ...grpc.CallOption) (*GetSandboxRuntimesResponse, error)
 	// ReportActorCrashed reports that the sandbox of the actor this worker
 	// hosts died on its own, for atelet to forward to the control plane's
 	// WorkerService, which this mirrors.
@@ -158,6 +172,16 @@ func (c *workerSupportClient) GetActorEgressPolicy(ctx context.Context, in *GetA
 	return out, nil
 }
 
+func (c *workerSupportClient) GetSandboxRuntimes(ctx context.Context, in *GetSandboxRuntimesRequest, opts ...grpc.CallOption) (*GetSandboxRuntimesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxRuntimesResponse)
+	err := c.cc.Invoke(ctx, WorkerSupport_GetSandboxRuntimes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *workerSupportClient) ReportActorCrashed(ctx context.Context, in *ReportActorCrashedRequest, opts ...grpc.CallOption) (*ReportActorCrashedResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReportActorCrashedResponse)
@@ -210,6 +234,19 @@ type WorkerSupportServer interface {
 	// Control.GetActorEgressPolicy. An error is the control plane's, passed
 	// through as it was given.
 	GetActorEgressPolicy(context.Context, *GetActorEgressPolicyRequest) (*GetActorEgressPolicyResponse, error)
+	// GetSandboxRuntimes returns the sandbox runtimes atelet keeps for the
+	// calling worker: the default runtime and the restorable runtimes of the
+	// worker's pool's SandboxConfig, the same content atelet writes to the
+	// worker's on-node sandbox runtimes file.
+	//
+	// Colocated workers never call this: they read the file directly off the
+	// shared node filesystem. It exists for a network worker (a separate guest
+	// Pod) that shares no filesystem with atelet and so cannot read that file;
+	// it fetches the runtimes over this call instead and registers them through
+	// RegisterWorker. The worker is identified only by its mTLS certificate,
+	// never by the request, so a worker gets its own pool's runtimes and no
+	// other's.
+	GetSandboxRuntimes(context.Context, *GetSandboxRuntimesRequest) (*GetSandboxRuntimesResponse, error)
 	// ReportActorCrashed reports that the sandbox of the actor this worker
 	// hosts died on its own, for atelet to forward to the control plane's
 	// WorkerService, which this mirrors.
@@ -241,6 +278,9 @@ func (UnimplementedWorkerSupportServer) RequestActorSuspend(context.Context, *Re
 }
 func (UnimplementedWorkerSupportServer) GetActorEgressPolicy(context.Context, *GetActorEgressPolicyRequest) (*GetActorEgressPolicyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetActorEgressPolicy not implemented")
+}
+func (UnimplementedWorkerSupportServer) GetSandboxRuntimes(context.Context, *GetSandboxRuntimesRequest) (*GetSandboxRuntimesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxRuntimes not implemented")
 }
 func (UnimplementedWorkerSupportServer) ReportActorCrashed(context.Context, *ReportActorCrashedRequest) (*ReportActorCrashedResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportActorCrashed not implemented")
@@ -374,6 +414,24 @@ func _WorkerSupport_GetActorEgressPolicy_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerSupport_GetSandboxRuntimes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxRuntimesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerSupportServer).GetSandboxRuntimes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerSupport_GetSandboxRuntimes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerSupportServer).GetSandboxRuntimes(ctx, req.(*GetSandboxRuntimesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WorkerSupport_ReportActorCrashed_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReportActorCrashedRequest)
 	if err := dec(in); err != nil {
@@ -422,6 +480,10 @@ var WorkerSupport_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetActorEgressPolicy",
 			Handler:    _WorkerSupport_GetActorEgressPolicy_Handler,
+		},
+		{
+			MethodName: "GetSandboxRuntimes",
+			Handler:    _WorkerSupport_GetSandboxRuntimes_Handler,
 		},
 		{
 			MethodName: "ReportActorCrashed",

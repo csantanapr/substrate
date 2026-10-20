@@ -64,6 +64,20 @@ service WorkerSupport {
   // through as it was given.
   rpc GetActorEgressPolicy(GetActorEgressPolicyRequest) returns (GetActorEgressPolicyResponse) {}
 
+  // GetSandboxRuntimes returns the sandbox runtimes atelet keeps for the
+  // calling worker: the default runtime and the restorable runtimes of the
+  // worker's pool's SandboxConfig, the same content atelet writes to the
+  // worker's on-node sandbox runtimes file.
+  //
+  // Colocated workers never call this: they read the file directly off the
+  // shared node filesystem. It exists for a network worker (a separate guest
+  // Pod) that shares no filesystem with atelet and so cannot read that file;
+  // it fetches the runtimes over this call instead and registers them through
+  // RegisterWorker. The worker is identified only by its mTLS certificate,
+  // never by the request, so a worker gets its own pool's runtimes and no
+  // other's.
+  rpc GetSandboxRuntimes(GetSandboxRuntimesRequest) returns (GetSandboxRuntimesResponse) {}
+
   // ReportActorCrashed reports that the sandbox of the actor this worker
   // hosts died on its own, for atelet to forward to the control plane's
   // WorkerService, which this mirrors.
@@ -76,6 +90,56 @@ message AcquireWorkerEpochRequest {
 message AcquireWorkerEpochResponse {
   // The epoch handed out, for this worker process to register with.
   int64 epoch = 1;
+}
+
+message GetSandboxRuntimesRequest {
+  // Intentionally empty: the worker is identified by its mTLS certificate.
+}
+
+// SandboxRuntimeAttributes carries one runtime's compatibility attributes, the
+// same key-value set a colocated worker reads from its sandbox runtimes file.
+// Keeping the wire shape identical to the file content lets a network worker
+// build exactly the request a colocated worker builds from the file.
+message SandboxRuntimeAttributes {
+  // +k8s:optional
+  // +k8s:maxItems=32
+  // +k8s:listType=map
+  // +k8s:listMapKey=key
+  repeated AttributeEntry attributes = 1;
+}
+
+// SandboxRuntimesClass is one entry of the sandbox runtimes file: a sandbox
+// class and the runtimes the worker runs it under.
+message SandboxRuntimesClass {
+  // e.g. "gvisor", "microvm"
+  //
+  // +k8s:optional
+  // +k8s:maxLength=63
+  string sandbox_class = 1;
+
+  // Attributes of the runtime new and cold-booted actors of this class start
+  // under.
+  SandboxRuntimeAttributes default_runtime = 2;
+
+  // Additional runtimes (excluding default_runtime) the worker can restore
+  // snapshots of this class from right now.
+  //
+  // +k8s:optional
+  // +k8s:maxItems=32
+  // +k8s:listType=atomic
+  repeated SandboxRuntimeAttributes restorable_runtimes = 3;
+}
+
+message GetSandboxRuntimesResponse {
+  // The sandbox classes of the worker's sandbox runtimes file, in file order.
+  // Empty when atelet has not yet built the file (e.g. the pool's
+  // SandboxConfig has not resolved), which the worker treats as "not ready
+  // yet" and retries, exactly as it would an absent file.
+  //
+  // +k8s:optional
+  // +k8s:maxItems=32
+  // +k8s:listType=atomic
+  repeated SandboxRuntimesClass sandbox_classes = 1;
 }
 
 message RegisterWorkerRequest {
