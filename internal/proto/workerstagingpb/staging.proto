@@ -1,0 +1,103 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package workerstaging;
+
+option go_package = "go.ate.dev/substrate/internal/proto/workerstagingpb";
+
+// WorkerStaging materializes only the typed files an activation needs on a
+// network worker that does not share the node atelet's filesystem. It is
+// served on the same node-atelet-authenticated worker connection as the
+// Worker service (see cmd/atelet): a network worker reaches it over the
+// workertransport mTLS listener, a colocated worker never does. Callers
+// cannot choose a destination path or obtain a generic file reader.
+service WorkerStaging {
+  rpc PrepareActivation(Activation) returns (Preparation);
+  rpc PutArtifact(stream ArtifactChunk) returns (Empty);
+  rpc CommitActivation(ActivationRef) returns (Empty);
+  // Reclaims only this generation's pending files; committed actor state and
+  // shared immutable artifacts are never removed by an abort.
+  rpc AbortActivation(ActivationRef) returns (Empty);
+  rpc ApplySystemInfo(SystemInfoUpdate) returns (Empty);
+  rpc ExportCheckpoint(ActivationRef) returns (stream CheckpointChunk);
+  rpc CleanupActor(ActivationRef) returns (Empty);
+}
+
+message Empty {}
+
+message ActivationRef {
+  string actor_uid = 1;
+  string generation = 2;
+  string worker_uid = 3;
+}
+
+enum ArtifactKind {
+  ARTIFACT_KIND_UNSPECIFIED = 0;
+  ARTIFACT_KIND_IMAGE_LAYER = 1;
+  ARTIFACT_KIND_RUNTIME = 2;
+  ARTIFACT_KIND_ACTOR_STATE = 3;
+}
+
+message Artifact {
+  ArtifactKind kind = 1;
+  // A layer's diffID hex, a canonical runtime asset basename, or the
+  // activation generation for actor state. Never a filesystem path.
+  string id = 2;
+  string sha256 = 3;
+  int64 size = 4;
+}
+
+message SystemInfoFile {
+  string volume = 1;
+  string path = 2;
+  bytes contents = 3;
+}
+
+message Activation {
+  ActivationRef ref = 1;
+  string actor_atespace = 2;
+  string actor_name = 3;
+  repeated Artifact artifacts = 4;
+  // The only projected file destinations later updates may address.
+  // Contents are carried in the actor-state artifact, not this declaration.
+  repeated SystemInfoFile system_info_files = 5;
+}
+
+message Preparation {
+  repeated Artifact missing = 1;
+}
+
+message ArtifactChunk {
+  ActivationRef ref = 1;
+  ArtifactKind kind = 2;
+  string id = 3;
+  bytes data = 4;
+}
+
+message SystemInfoUpdate {
+  ActivationRef ref = 1;
+  repeated SystemInfoFile files = 2;
+}
+
+// Each file is a header (name and size), bounded data chunks, then a SHA256
+// footer. Only files recorded by a successful CheckpointWorkload are exported.
+// The receiver also checks exact membership against that RPC's returned list.
+message CheckpointChunk {
+  string file_name = 1;
+  int64 size = 2;
+  bytes data = 3;
+  string sha256 = 4;
+}

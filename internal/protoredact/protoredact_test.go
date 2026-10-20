@@ -32,6 +32,7 @@ import (
 	"go.ate.dev/substrate/internal/proto/glutton"
 	"go.ate.dev/substrate/internal/proto/grpcechopb"
 	"go.ate.dev/substrate/internal/proto/objectstoreexchangepb"
+	"go.ate.dev/substrate/internal/proto/workerstagingpb"
 	"go.ate.dev/substrate/internal/protoredact"
 	"go.ate.dev/substrate/pkg/proto/ateconfigpb"
 	"google.golang.org/protobuf/proto"
@@ -369,6 +370,7 @@ var ourProtoFiles = []protoreflect.FileDescriptor{
 	grpcechopb.File_internal_proto_grpcechopb_grpcecho_proto,
 	objectstoreexchangepb.File_internal_proto_objectstoreexchangepb_exchange_proto,
 	objectstore.File_api_objectstore_v1_objectstore_proto,
+	workerstagingpb.File_internal_proto_workerstagingpb_staging_proto,
 }
 
 // forEachField calls fn for every field of every message in ourProtoFiles,
