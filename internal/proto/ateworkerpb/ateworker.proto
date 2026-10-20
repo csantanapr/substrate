@@ -268,6 +268,20 @@ message WorkloadSpec {
   // +k8s:listType=map
   // +k8s:listMapKey=name
   repeated Container containers = 1;
+
+  // nested_containers, when set with enabled=true, opts the actor into running
+  // a nested container stack inside its gVisor sandbox. atelet forwards it from
+  // the ateletpb WorkloadSpec; ateworker-gvisor turns it into runsc flags and
+  // the image-store tmpfs mount. Absent/disabled leaves the sandbox unchanged.
+  NestedContainers nested_containers = 2;
+}
+
+// NestedContainers mirrors ateletpb.NestedContainers (the image-store quantity
+// is already parsed to bytes by ate-api-server).
+message NestedContainers {
+  bool enabled = 1;
+  bool packet_socket_write = 2;
+  int64 image_store_size_bytes = 3;
 }
 
 // A container's mounts split into four typed lists. Each list's key keeps

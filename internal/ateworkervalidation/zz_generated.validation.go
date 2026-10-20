@@ -2505,5 +2505,6 @@ func Validate_WorkloadSpec(
 		errs = append(errs, fn(fldPath.Child("containers"), obj.Containers, oldVal, oldObj != nil)...)
 	}
 
+	// field ateworkerpb.WorkloadSpec.NestedContainers has no validation
 	return errs
 }
