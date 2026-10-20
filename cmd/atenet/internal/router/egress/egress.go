@@ -182,6 +182,16 @@ func (h *Handler) handleConnect(ctx context.Context, md *extproc.RequestMetadata
 		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_Forbidden, deniedBody)
 	}
 
+	// The optional installation-wide platform egress profile is a coarse gate
+	// in front of the per-actor policy: when it is in force, only the exact
+	// IP:port destinations the installer configured may be dialed, whatever any
+	// actor's own policy would otherwise allow. Absent, it passes and the
+	// per-actor policy applies alone (platform_policy.go).
+	if !platformDestinationAllowed(dest) {
+		slog.WarnContext(ctx, "egress denied: destination is outside the platform network profile", slog.Any("actor", ref), slog.String("leg", leg), slog.String("destination", md.Host))
+		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_Forbidden, deniedBody)
+	}
+
 	// This also warms the cache for the requests inside the tunnel, and
 	// refuses an actor whose policy could allow nothing.
 	policy, err := h.lookupPolicy(ctx, leg, ref)
