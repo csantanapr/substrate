@@ -18,12 +18,14 @@ package atunnel
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
+	"google.golang.org/grpc"
 
 	"go.ate.dev/substrate/internal/ateattr"
 	"go.ate.dev/substrate/internal/ateletdial"
@@ -31,6 +33,7 @@ import (
 	"go.ate.dev/substrate/internal/nodepath"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/workertransport"
 )
 
 const (
@@ -75,7 +78,11 @@ type actorEgressPolicy struct {
 func (t *Tunnel) ActorEgressPolicy(actor resources.ActorAttribution) dns.PolicySource {
 	return &actorEgressPolicy{
 		fetch: func(ctx context.Context) (*ateletpb.EgressPolicy, error) {
-			conn, err := ateletdial.Dial(nodepath.WorkerSupportSocket, t.ateletTLS)
+			// Colocated: the node-local Unix socket. Network
+			// (cfg.AteletAddress set): the atelet-workers Service over TCP
+			// mTLS, exactly as register dials. address takes precedence so a
+			// network worker never falls back to a socket it cannot reach.
+			conn, err := dialAtelet(nodepath.WorkerSupportSocket, t.cfg.AteletAddress, t.ateletTLS)
 			if err != nil {
 				return nil, err
 			}
@@ -179,6 +186,22 @@ func (p *actorEgressPolicy) record(ctx context.Context, policy *ateletpb.EgressP
 	p.policy = policy
 	p.expires = now.Add(p.ttl)
 	return policy, nil
+}
+
+// dialAtelet opens the atelet connection for the egress-policy fetch: the TCP
+// mTLS path to the atelet-workers Service when address is set (the network
+// mode), the node-local Unix socket otherwise. address takes
+// precedence so a misconfiguration cannot silently fall back to a Unix socket a
+// network worker cannot reach, and the network path never uses plaintext
+// (workertransport.Dial refuses a nil config and a non-host:port address). Both
+// paths carry the same tlsConfig, which authenticates this worker and verifies
+// atelet by its SPIFFE id and node incarnation, so the network path adds a
+// transport, not a weaker trust check.
+func dialAtelet(socketPath, address string, tlsConfig *tls.Config) (*grpc.ClientConn, error) {
+	if address != "" {
+		return workertransport.Dial(address, tlsConfig)
+	}
+	return ateletdial.Dial(socketPath, tlsConfig)
 }
 
 // getEgressPolicy asks atelet for actor's egress policy, returning nil if the

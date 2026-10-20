@@ -34,10 +34,13 @@ import (
 // maxCrashMessageBytes matches the control plane's limit on a crash message.
 const maxCrashMessageBytes = 4096
 
-// CrashReporter tells the control plane, through the node-local atelet, that
-// the sandbox of an actor this ateworker hosts died on its own.
+// CrashReporter tells the control plane, through the node atelet, that the
+// sandbox of an actor this ateworker hosts died on its own. It reaches atelet
+// the way registration does (see dialAtelet): over TCP mTLS when address is
+// set, over the node-local Unix socket otherwise.
 type CrashReporter struct {
 	socketPath string
+	address    string
 	tlsConfig  *tls.Config
 }
 
@@ -48,7 +51,7 @@ func NewCrashReporter(cfg ReportConfig) (*CrashReporter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("crash reporter: %w", err)
 	}
-	return &CrashReporter{socketPath: cfg.SocketPath, tlsConfig: tlsConfig}, nil
+	return &CrashReporter{socketPath: cfg.SocketPath, address: cfg.Address, tlsConfig: tlsConfig}, nil
 }
 
 // ReportCrashed reports that actor's sandbox died, retrying until the control
@@ -57,7 +60,7 @@ func NewCrashReporter(cfg ReportConfig) (*CrashReporter, error) {
 // having moved on or an operation in flight owning it, is an answer and is
 // logged rather than returned.
 func (r *CrashReporter) ReportCrashed(ctx context.Context, actor resources.ActorAttribution, message string) error {
-	conn, err := ateletdial.Dial(r.socketPath, r.tlsConfig)
+	conn, err := dialAtelet(r.socketPath, r.address, r.tlsConfig)
 	if err != nil {
 		return fmt.Errorf("dial atelet: %w", err)
 	}

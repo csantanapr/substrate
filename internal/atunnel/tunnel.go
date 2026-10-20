@@ -73,6 +73,15 @@ type Config struct {
 	EgressTrustBundle string
 	// DNSEgressPolicy selects the DNS egress policy enforcement mode.
 	DNSEgressPolicy string
+	// AteletAddress is the node-local atelet-workers Service host:port used in
+	// the network-worker mode, where the worker runs in a separate
+	// guest Pod and cannot reach atelet's Unix socket. Empty (the default)
+	// keeps the Unix-socket dial for the credential broker and egress-policy
+	// fetch, so a colocated worker's atelet connections are
+	// unchanged. It is set to the same value register uses (--atelet-address),
+	// not a flag of its own, so the two cannot diverge. When set it takes
+	// precedence over the Unix socket on both atelet dial paths.
+	AteletAddress string
 }
 
 // RegisterFlags registers the atunnel flags on fs and returns the Config they
@@ -207,7 +216,12 @@ func (t *Tunnel) PrepareEgress(ctx context.Context, actor resources.ActorAttribu
 		return nil, fmt.Errorf("invalid egress gateway address %q: %w", gateway.GetAddress(), err)
 	}
 	certificateSource, err := egress.NewBrokerCertificateSource(egress.BrokerConfig{
+		// Colocated: the Unix socket. Network: Address is set from
+		// cfg.AteletAddress, which the broker prefers over the socket, so a
+		// network worker reaches atelet over TCP mTLS and never the socket it
+		// cannot see.
 		SocketPath:           nodepath.WorkerSupportSocket,
+		Address:              t.cfg.AteletAddress,
 		CredentialBundlePath: t.cfg.CredentialBundle,
 		TrustBundlePath:      t.cfg.TrustBundle,
 		ActorAtespace:        actor.Ref.Atespace,

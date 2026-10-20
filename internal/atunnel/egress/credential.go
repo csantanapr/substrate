@@ -28,6 +28,8 @@ import (
 
 	"go.ate.dev/substrate/internal/ateletdial"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/workertransport"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -35,7 +37,14 @@ import (
 // BrokerCertificateSource owns atunnel's actor private key and obtains the
 // matching short-lived certificate from the node-local atelet.
 type BrokerCertificateSource struct {
+	// socketPath is the atelet WorkerSupport Unix socket, used in the default
+	// (colocated) mode. Ignored when address is set.
 	socketPath string
+	// address is the atelet-workers Service host:port for the network
+	// mode, where this worker runs in a separate guest Pod and cannot reach the
+	// Unix socket. Empty (the default) keeps the Unix-socket dial, so a
+	// colocated worker is unchanged.
+	address string
 
 	actorAtespace string
 	actorName     string
@@ -50,8 +59,16 @@ type BrokerCertificateSource struct {
 
 // BrokerConfig configures the node-local atelet credential broker client.
 type BrokerConfig struct {
-	// SocketPath is the atelet-owned Unix socket shared with this worker.
+	// SocketPath is the atelet-owned Unix socket shared with this worker, used
+	// in the default (colocated) mode. Ignored when Address is set.
 	SocketPath string
+	// Address is the atelet-workers Service host:port for the network
+	// mode, where the worker runs in a separate guest Pod and cannot reach the
+	// Unix socket. Empty (the default) keeps the Unix-socket dial, so a
+	// colocated worker's broker connection is unchanged.
+	// When set it takes precedence over SocketPath, so a misconfiguration
+	// cannot silently fall back to a socket a network worker cannot reach.
+	Address string
 	// CredentialBundlePath is the worker Pod certificate and private key used
 	// only to authenticate atunnel to atelet.
 	CredentialBundlePath string
@@ -71,10 +88,16 @@ type BrokerConfig struct {
 
 // NewBrokerCertificateSource creates one actor key for this activation. The key
 // is reused across renewals and never leaves atunnel; only its CSR crosses the
-// credential broker socket.
+// credential broker connection.
 func NewBrokerCertificateSource(cfg BrokerConfig) (*BrokerCertificateSource, error) {
-	if cfg.SocketPath == "" || cfg.CredentialBundlePath == "" || cfg.TrustBundlePath == "" {
-		return nil, fmt.Errorf("credential broker socket, credentials, trust bundle are required")
+	// A colocated worker (no Address) needs the Unix socket; a network worker
+	// (Address set) reaches atelet over TCP and ignores the socket. Exactly one
+	// of the two must identify atelet.
+	if cfg.Address == "" && cfg.SocketPath == "" {
+		return nil, fmt.Errorf("credential broker socket or address is required")
+	}
+	if cfg.CredentialBundlePath == "" || cfg.TrustBundlePath == "" {
+		return nil, fmt.Errorf("credential broker credentials and trust bundle are required")
 	}
 
 	if cfg.ActorAtespace == "" || cfg.ActorName == "" || cfg.ActorUID == "" {
@@ -95,12 +118,29 @@ func NewBrokerCertificateSource(cfg BrokerConfig) (*BrokerCertificateSource, err
 
 	return &BrokerCertificateSource{
 		socketPath:    cfg.SocketPath,
+		address:       cfg.Address,
 		actorAtespace: cfg.ActorAtespace,
 		actorName:     cfg.ActorName,
 		actorUID:      cfg.ActorUID,
 		tlsConfig:     tlsConfig,
 		privateKey:    privateKey,
 	}, nil
+}
+
+// dialAtelet opens the atelet connection for this source: the TCP mTLS path to
+// the atelet-workers Service when address is set (the network mode),
+// the node-local Unix socket otherwise. address takes precedence so a
+// misconfiguration cannot silently fall back to a Unix socket a network worker
+// cannot reach, and the network path never uses plaintext (workertransport.Dial
+// refuses a nil config and a non-host:port address). Both paths carry the same
+// tlsConfig, which authenticates this worker and verifies atelet by its SPIFFE
+// id and node incarnation, so the network path adds a transport, not a weaker
+// trust check.
+func dialAtelet(socketPath, address string, tlsConfig *tls.Config) (*grpc.ClientConn, error) {
+	if address != "" {
+		return workertransport.Dial(address, tlsConfig)
+	}
+	return ateletdial.Dial(socketPath, tlsConfig)
 }
 
 // mintAttempts bounds the retries of a mint whose broker connection came back
@@ -139,7 +179,7 @@ func (s *BrokerCertificateSource) mintOnce(ctx context.Context, csr []byte) (tim
 
 	// A fresh connection picks up rotated worker credentials and forces atelet's
 	// current certificate and node identity to be verified for every mint.
-	conn, err := ateletdial.Dial(s.socketPath, s.tlsConfig)
+	conn, err := dialAtelet(s.socketPath, s.address, s.tlsConfig)
 	if err != nil {
 		return time.Time{}, err
 	}

@@ -40,6 +40,8 @@ import (
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/sandboxruntimes"
 	"go.ate.dev/substrate/internal/workercapacity"
+	"go.ate.dev/substrate/internal/workertransport"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -213,7 +215,15 @@ func readLimit(path string) int64 {
 // ReportConfig configures how a worker reaches the node-local atelet and what
 // it registers with.
 type ReportConfig struct {
-	SocketPath           string
+	// SocketPath is the node-local atelet WorkerSupport Unix socket, used in
+	// the default (colocated) mode where the worker shares the node's
+	// filesystem. Ignored when Address is set.
+	SocketPath string
+	// Address is the atelet-workers Service host:port for the network
+	// mode, where the worker runs in a separate guest Pod and cannot reach the
+	// Unix socket. Empty (the default) keeps the Unix-socket path, so a
+	// colocated worker's dial is unchanged.
+	Address              string
 	CredentialBundlePath string
 	TrustBundlePath      string
 	// AteletSPIFFEID is the identity the node-local atelet must present. It
@@ -276,13 +286,36 @@ func Report(ctx context.Context, cfg ReportConfig, epoch *Epoch) error {
 	if err != nil {
 		return fmt.Errorf("register worker: %w", err)
 	}
-	client := &dialingClient{socketPath: cfg.SocketPath, tlsConfig: tlsConfig}
+	client := &dialingClient{socketPath: cfg.SocketPath, address: cfg.Address, tlsConfig: tlsConfig}
+
+	// Where the runtimes come from differs by mode. A colocated worker reads
+	// them from its on-node sandbox runtimes file, which atelet writes and
+	// rewrites, so it reads the file and watches it for changes. A network
+	// worker (Address set) shares no filesystem with atelet, so it fetches the
+	// runtimes over the GetSandboxRuntimes RPC and has no file to watch; the
+	// reconciler's periodic resync picks up a later change. Both feed the same
+	// reconciler and build the same requests.
+	if cfg.Address != "" {
+		read := func() (*sandboxruntimes.File, error) {
+			return fetchRuntimes(ctx, cfg.SocketPath, cfg.Address, tlsConfig)
+		}
+		// nil channel: the reconciler falls back to resyncInterval polling,
+		// which is how a network worker notices a runtimes change.
+		return runWith(ctx, cfg, capacity, client, epoch, read, nil)
+	}
 	changes := WatchFilePath(ctx, cfg.RuntimesFile)
 	return run(ctx, cfg, capacity, client, epoch, changes)
 }
 
-// run registers, then reports runtimes until ctx ends or the epoch is refused.
+// run registers, then reports the runtimes in the sandbox runtimes file until
+// ctx ends or the epoch is refused.
 func run(ctx context.Context, cfg ReportConfig, capacity *ateletpb.WorkerResources, client supportClient, epoch *Epoch, changes <-chan struct{}) error {
+	read := func() (*sandboxruntimes.File, error) { return sandboxruntimes.Read(cfg.RuntimesFile) }
+	return runWith(ctx, cfg, capacity, client, epoch, read, changes)
+}
+
+// runWith is run with the runtimes read by read.
+func runWith(ctx context.Context, cfg ReportConfig, capacity *ateletpb.WorkerResources, client supportClient, epoch *Epoch, read func() (*sandboxruntimes.File, error), changes <-chan struct{}) error {
 	registered, err := registerOnce(ctx, client, &ateletpb.RegisterWorkerRequest{
 		Ips:      cfg.PodIPs,
 		Capacity: capacity,
@@ -294,7 +327,7 @@ func run(ctx context.Context, cfg ReportConfig, capacity *ateletpb.WorkerResourc
 	r := newReconciler(
 		cfg,
 		registered,
-		func() (*sandboxruntimes.File, error) { return sandboxruntimes.Read(cfg.RuntimesFile) },
+		read,
 		client.SetWorkerSandboxRuntimes,
 	)
 	return r.run(ctx, changes)
@@ -352,6 +385,58 @@ func registerOnce(ctx context.Context, client supportClient, req *ateletpb.Regis
 			return 0, err
 		}
 	}
+}
+
+// fetchRuntimes dials atelet over the network path and reads the sandbox
+// runtimes atelet keeps for this worker via GetSandboxRuntimes, returning them
+// as a sandboxruntimes.File so the reconciler treats them exactly as a file
+// read. A response with no sandbox classes reads as fs.ErrNotExist, which sync
+// treats as "not ready yet" -- identical to an absent file for a colocated
+// worker.
+func fetchRuntimes(ctx context.Context, socketPath, address string, tlsConfig *tls.Config) (*sandboxruntimes.File, error) {
+	conn, err := dialAtelet(socketPath, address, tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	callCtx, cancel := context.WithTimeout(ctx, reportTimeout)
+	defer cancel()
+	resp, err := ateletpb.NewWorkerSupportClient(conn).GetSandboxRuntimes(callCtx, &ateletpb.GetSandboxRuntimesRequest{})
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.GetSandboxClasses()) == 0 {
+		// atelet has not built this worker's runtimes yet: report it the way
+		// an absent file reads for a colocated worker.
+		return nil, fs.ErrNotExist
+	}
+	file := &sandboxruntimes.File{}
+	for _, c := range resp.GetSandboxClasses() {
+		class := sandboxruntimes.Class{
+			SandboxClass:   c.GetSandboxClass(),
+			DefaultRuntime: sandboxruntimes.Runtime{Version: attributesFromProto(c.GetDefaultRuntime())},
+		}
+		for _, r := range c.GetRestorableRuntimes() {
+			class.RestorableRuntimes = append(class.RestorableRuntimes, sandboxruntimes.Runtime{Version: attributesFromProto(r)})
+		}
+		file.SandboxClasses = append(file.SandboxClasses, class)
+	}
+	return file, nil
+}
+
+// attributesFromProto converts the wire attribute list to the file's attribute
+// map. A nil message or empty list yields a nil map, which sync reads as "no
+// default runtime yet".
+func attributesFromProto(in *ateletpb.SandboxRuntimeAttributes) sandboxruntimes.Attributes {
+	entries := in.GetAttributes()
+	if len(entries) == 0 {
+		return nil
+	}
+	attrs := make(sandboxruntimes.Attributes, len(entries))
+	for _, e := range entries {
+		attrs[e.GetKey()] = e.GetValue()
+	}
+	return attrs
 }
 
 // reconciler reports the runtimes in the sandbox runtimes file whenever they
@@ -473,7 +558,10 @@ func (r *reconciler) sync(ctx context.Context) (retry bool, err error) {
 // dialingClient dials atelet for each call.
 type dialingClient struct {
 	socketPath string
-	tlsConfig  *tls.Config
+	// address, when set, is the atelet-workers Service a network worker
+	// dials over TCP mTLS instead of the socket (see dialAtelet).
+	address   string
+	tlsConfig *tls.Config
 }
 
 func (c *dialingClient) AcquireWorkerEpoch(ctx context.Context) (int64, error) {
@@ -501,7 +589,7 @@ func (c *dialingClient) SetWorkerSandboxRuntimes(ctx context.Context, req *atele
 }
 
 func (c *dialingClient) call(ctx context.Context, f func(context.Context, ateletpb.WorkerSupportClient) error) error {
-	conn, err := ateletdial.Dial(c.socketPath, c.tlsConfig)
+	conn, err := dialAtelet(c.socketPath, c.address, c.tlsConfig)
 	if err != nil {
 		return err
 	}
@@ -509,4 +597,15 @@ func (c *dialingClient) call(ctx context.Context, f func(context.Context, atelet
 	callCtx, cancel := context.WithTimeout(ctx, reportTimeout)
 	defer cancel()
 	return f(callCtx, ateletpb.NewWorkerSupportClient(conn))
+}
+
+// dialAtelet opens the atelet connection for reporting: the TCP mTLS path to
+// the atelet-workers Service when address is set, the node-local Unix socket
+// otherwise. address takes precedence so a misconfiguration cannot silently
+// fall back to a Unix socket a network worker cannot reach.
+func dialAtelet(socketPath, address string, tlsConfig *tls.Config) (*grpc.ClientConn, error) {
+	if address != "" {
+		return workertransport.Dial(address, tlsConfig)
+	}
+	return ateletdial.Dial(socketPath, tlsConfig)
 }
