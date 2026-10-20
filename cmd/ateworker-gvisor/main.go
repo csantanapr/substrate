@@ -705,16 +705,8 @@ func (s *AteWorkerService) RunWorkload(ctx context.Context, req *ateworkerpb.Run
 	if err != nil {
 		return nil, err
 	}
-	rcmd := &runsc{
-		path:           req.GetRunscPath(),
-		actorUID:       req.GetActorUid(),
-		actorDirs:      req.GetActorDirs(),
-		size:           sizing.FromLimits(req.GetResources().GetLimits()),
-		durableVolumes: durableVolumeNames(req.GetSpec()),
-		containers:     req.GetSpec().GetContainers(),
-		flags:          s.flags,
-		enableCoreTags: s.enableCoreTags,
-	}
+	rcmd := newRunRunsc(s.flags, req)
+	rcmd.enableCoreTags = s.enableCoreTags
 	var containersToDelete []string
 	defer func() {
 		if retErr != nil {
@@ -865,13 +857,11 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	//   * After we exit, atelet will tear down OCI bundles and reset the actor directory.
 
 	// Checkpoint only saves state; no sizing is applied, so size is left zero.
-	rcmd := &runsc{
-		path:           req.GetRunscPath(),
-		actorUID:       req.GetActorUid(),
-		actorDirs:      req.GetActorDirs(),
-		flags:          s.flags,
-		enableCoreTags: s.enableCoreTags,
-	}
+	// The nested flags must match the ones the sandbox was created with, so
+	// checkpoint carries them too; checkpoint writes no OCI spec, so
+	// the image-store size is not needed here.
+	rcmd := newCheckpointRunsc(s.flags, req)
+	rcmd.enableCoreTags = s.enableCoreTags
 
 	checkpointPath := req.GetActorDirs().GetCheckpointDir()
 	// Clear any partial files from a previous failed attempt.
@@ -1184,16 +1174,8 @@ func (s *AteWorkerService) RestoreWorkload(ctx context.Context, req *ateworkerpb
 	if err != nil {
 		return nil, err
 	}
-	rcmd := &runsc{
-		path:           req.GetRunscPath(),
-		actorUID:       req.GetActorUid(),
-		actorDirs:      req.GetActorDirs(),
-		size:           sizing.FromLimits(req.GetResources().GetLimits()),
-		durableVolumes: durableVolumeNames(req.GetSpec()),
-		containers:     req.GetSpec().GetContainers(),
-		flags:          s.flags,
-		enableCoreTags: s.enableCoreTags,
-	}
+	rcmd := newRestoreRunsc(s.flags, req)
+	rcmd.enableCoreTags = s.enableCoreTags
 	var containersToDelete []string
 	defer func() {
 		if retErr != nil {

@@ -48,23 +48,137 @@ type runsc struct {
 	flags *flagStore
 	// enableCoreTags enables Linux core scheduling tags (--enable-core-tags).
 	enableCoreTags bool
+	// nested carries the actor's nested-container opt-in flags. The zero value
+	// adds nothing, so a default actor's runsc argv is byte-for-byte unchanged.
+	nested nestedRuntime
+	// imageStoreSizeBytes caps the nested image-store tmpfs. Only read when
+	// nested.enabled; 0 selects ocispec.DefaultNestedImageStoreBytes.
+	imageStoreSizeBytes int64
+}
+
+// nestedRuntime is the set of runsc top-level flags an actor's nested-container
+// opt-in adds. It is set from the workload spec in RunWorkload,
+// CheckpointWorkload and RestoreWorkload, so the same flags accompany the
+// sandbox on every lifecycle call.
+type nestedRuntime struct {
+	// enabled adds -net-raw, which the nested container runtime needs inside
+	// gVisor.
+	enabled bool
+	// packetSocketWrite adds -allow-packet-socket-write (Docker v28+). It is
+	// only ever set alongside enabled: admission rejects it on its own.
+	packetSocketWrite bool
+}
+
+// nestedRuntimeFromSpec reads the opt-in off the worker spec. Returns the zero
+// value (adds no flags) when the spec carries no nested config or it is
+// disabled, keeping the default actor's argv byte-for-byte unchanged.
+func nestedRuntimeFromSpec(spec *ateworkerpb.WorkloadSpec) nestedRuntime {
+	n := spec.GetNestedContainers()
+	if n == nil || !n.GetEnabled() {
+		return nestedRuntime{}
+	}
+	return nestedRuntime{enabled: n.GetEnabled(), packetSocketWrite: n.GetPacketSocketWrite()}
+}
+
+// newRunRunsc builds the runsc for a RunWorkload request. Extracted so the
+// nested-flag wiring (nested + imageStoreSizeBytes, read from THIS request's
+// spec) is testable without standing up the full RPC: a change that dropped the
+// nested fields here would fail TestNewRunsc_*.
+func newRunRunsc(flags *flagStore, req *ateworkerpb.RunWorkloadRequest) *runsc {
+	return &runsc{
+		path:                req.GetRunscPath(),
+		actorUID:            req.GetActorUid(),
+		actorDirs:           req.GetActorDirs(),
+		size:                sizing.FromLimits(req.GetResources().GetLimits()),
+		durableVolumes:      durableVolumeNames(req.GetSpec()),
+		containers:          req.GetSpec().GetContainers(),
+		flags:               flags,
+		nested:              nestedRuntimeFromSpec(req.GetSpec()),
+		imageStoreSizeBytes: req.GetSpec().GetNestedContainers().GetImageStoreSizeBytes(),
+	}
+}
+
+// newCheckpointRunsc builds the runsc for a CheckpointWorkload request. Carries
+// the nested flags (they must match the create flags) but no sizing or
+// image-store size: checkpoint writes no OCI spec.
+func newCheckpointRunsc(flags *flagStore, req *ateworkerpb.CheckpointWorkloadRequest) *runsc {
+	return &runsc{
+		path:      req.GetRunscPath(),
+		actorUID:  req.GetActorUid(),
+		actorDirs: req.GetActorDirs(),
+		flags:     flags,
+		nested:    nestedRuntimeFromSpec(req.GetSpec()),
+	}
+}
+
+// newRestoreRunsc builds the runsc for a RestoreWorkload request, with the same
+// nested fields as create so the restored sandbox matches the capture.
+func newRestoreRunsc(flags *flagStore, req *ateworkerpb.RestoreWorkloadRequest) *runsc {
+	return &runsc{
+		path:                req.GetRunscPath(),
+		actorUID:            req.GetActorUid(),
+		actorDirs:           req.GetActorDirs(),
+		size:                sizing.FromLimits(req.GetResources().GetLimits()),
+		durableVolumes:      durableVolumeNames(req.GetSpec()),
+		containers:          req.GetSpec().GetContainers(),
+		flags:               flags,
+		nested:              nestedRuntimeFromSpec(req.GetSpec()),
+		imageStoreSizeBytes: req.GetSpec().GetNestedContainers().GetImageStoreSizeBytes(),
+	}
+}
+
+// topLevelFlags returns the runsc top-level (global) flags the nested-container
+// opt-in adds, in a fixed order. The zero value returns nil, so a default actor
+// gets none of them. packetSocketWrite is only emitted alongside -net-raw, so
+// its admission dependency (it requires enabled) cannot be violated here.
+func (n nestedRuntime) topLevelFlags() []string {
+	if !n.enabled {
+		return nil
+	}
+	flags := []string{"-net-raw"}
+	if n.packetSocketWrite {
+		flags = append(flags, "-allow-packet-socket-write")
+	}
+	return flags
+}
+
+// nestedFlagCommands are the runsc subcommands that configure the sandbox and
+// so must carry the nested top-level flags: create and start bring it up, and
+// gVisor restores a memory image only under the same top-level flags it was
+// created with, so checkpoint and restore must match. Other
+// subcommands (delete, state, list, kill, wait) rightly carry none: adding a
+// flag to one call site but not another would make restore fail.
+var nestedFlagCommands = map[string]bool{
+	"create":     true,
+	"start":      true,
+	"checkpoint": true,
+	"restore":    true,
 }
 
 // buildArgs constructs the runsc argument vector for command, appending
 // containerName at the end if non-empty:
 //
-//	<combined globalFlags> -root <stateDir> <command> <subcommandFlags> <extraArgs> [<containerName>]
+//	<combined globalFlags> <nested top-level flags> -root <stateDir> <command> <subcommandFlags> <extraArgs> [<containerName>]
+//
+// The nested top-level flags (empty for a default actor) are added among the
+// other global flags, for the four lifecycle commands only, through this one
+// builder so the four cannot diverge.
 func (r *runsc) buildArgs(command, containerName string, extraArgs ...string) []string {
 	cfg := r.flags.get()
 	globalFlags := cfg.globalFlags(command)
 	subcommandFlags := cfg.subcommandFlags(command)
+	var nestedFlags []string
+	if nestedFlagCommands[command] {
+		nestedFlags = r.nested.topLevelFlags()
+	}
 
 	args := make([]string, 0,
-		len(globalFlags)+1+2+1+len(subcommandFlags)+len(extraArgs)+1)
+		len(globalFlags)+1+len(nestedFlags)+2+1+len(subcommandFlags)+len(extraArgs)+1)
 	args = append(args, globalFlags...)
 	if r.enableCoreTags {
 		args = append(args, "--enable-core-tags")
 	}
+	args = append(args, nestedFlags...)
 	args = append(args, "-root", runscStateDir(r.actorDirs))
 	args = append(args, command)
 	args = append(args, subcommandFlags...)
@@ -115,12 +229,23 @@ func (r *runsc) writeSpec(containerName string) error {
 		}
 		spec = ocispec.Build(ocispec.Options{ActorUID: r.actorUID, ActorDirs: r.actorDirs, Container: r.containers[i]})
 	}
+	// A nested-container actor's application containers get a size-capped tmpfs
+	// at the nested image store. Never the sandbox root container (it runs no
+	// nested runtime); ShapeGVisor also guards that. nil for a default actor, so
+	// its spec is byte-for-byte unchanged.
+	var nestedStore *ocispec.NestedImageStore
+	if r.nested.enabled && containerName != ocispec.SandboxID {
+		nestedStore = &ocispec.NestedImageStore{SizeBytes: r.imageStoreSizeBytes}
+	}
 	ocispec.ShapeGVisor(spec, ocispec.GVisorOptions{
-		ActorUID:       r.actorUID,
-		ActorDirs:      r.actorDirs,
-		ContainerName:  containerName,
-		DurableVolumes: r.durableVolumes,
-		Size:           r.size,
+		// resolv.conf is written into the rootfs by setupAppRootfs, so no
+		// bind source is passed; NestedImageStore is independent of it.
+		ActorUID:         r.actorUID,
+		ActorDirs:        r.actorDirs,
+		ContainerName:    containerName,
+		DurableVolumes:   r.durableVolumes,
+		Size:             r.size,
+		NestedImageStore: nestedStore,
 	})
 	return ocispec.Save(bundlePath, spec)
 }
