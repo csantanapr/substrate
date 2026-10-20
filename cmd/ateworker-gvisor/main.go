@@ -57,6 +57,7 @@ import (
 	"go.ate.dev/substrate/internal/otlprelay"
 	"go.ate.dev/substrate/internal/preview"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/proto/workerstagingpb"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/serverboot"
 	"go.ate.dev/substrate/internal/sizing"
@@ -64,6 +65,7 @@ import (
 	"go.ate.dev/substrate/internal/version"
 	"go.ate.dev/substrate/internal/wakeupprobe"
 	"go.ate.dev/substrate/internal/workerstats"
+	"go.ate.dev/substrate/internal/workertransport"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
@@ -114,6 +116,13 @@ var (
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 	previewFlags = pflag.StringSlice("preview", nil, "Preview gates to enable.")
 
+	// One-shot guest user-namespace setup. When --setup-guest-userns is passed,
+	// the binary runs setupGuestUserns and exits; it NEVER starts the worker.
+	// A dedicated initContainer (holding SYS_ADMIN+SYS_RESOURCE only) passes it,
+	// so the long-running worker never reaches this path. See guestuserns.go.
+	setupGuestUsernsFlag  = pflag.Bool("setup-guest-userns", false, "One-shot: raise the guest's user.max_user_namespaces so gVisor's sandbox can create its user namespace, verify it, and exit. Used only by the network worker's initContainer; the worker itself never passes it.")
+	guestUsernsTargetFlag = pflag.Int("guest-userns-target", guestUsernsDefaultTarget, "Value to raise user.max_user_namespaces to in --setup-guest-userns mode.")
+
 	otlpRelaySocket = pflag.String("otlp-relay-socket", nodepath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
 )
@@ -129,10 +138,26 @@ const minUsageSampleInterval = 50 * time.Second
 const workloadGracePeriod = 30 * time.Minute
 
 func main() {
+	// The clone-verify child of --setup-guest-userns re-execs this binary with a
+	// sentinel argv. Recognize it BEFORE pflag.Parse (the sentinel is not a flag)
+	// and before pid1.RunIfPID1 (so the child never re-enters the worker): its
+	// only job is to exist in a fresh user namespace and exit 0.
+	runGuestUsernsCloneProbeIfSentinel()
+
 	pid1.RunIfPID1()
 	pflag.Parse()
 	if *showVersion {
 		fmt.Println(version.String())
+		return
+	}
+
+	// One-shot guest user-namespace setup. This exits the process; it NEVER
+	// falls through to do(ctx), so the worker is not started in this mode.
+	if *setupGuestUsernsFlag {
+		if err := setupGuestUserns(hostGuestUsernsOps, *guestUsernsTargetFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "setup-guest-userns: FAILED: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -158,6 +183,9 @@ func do(ctx context.Context) error {
 	}
 
 	slog.InfoContext(ctx, "ateworker booting", slog.String("version", version.Version))
+	if err := validateNetworkFlags(); err != nil {
+		return err
+	}
 	if *maxActors < 0 {
 		return fmt.Errorf("--max-actors must not be negative, got %d", *maxActors)
 	}
@@ -170,21 +198,50 @@ func do(ctx context.Context) error {
 	}
 
 	const serviceName = "ateworker-gvisor"
-	// Export through atelet's node-local relay when it is there, so telemetry
-	// never touches the worker pod's network. A nil conn means it is not, and
-	// the providers fall back to OTEL_EXPORTER_OTLP_ENDPOINT, and export
-	// nothing without one.
+	// Telemetry export differs by mode, and the two modes make a DIFFERENT
+	// trade on a dial failure on purpose:
 	//
-	// A relay that cannot be dialed is logged rather than fatal, matching both
-	// ends of the same decision: Dial already treats an absent socket as a
-	// fallback rather than an error, and atelet logs and keeps going when it
-	// cannot serve the relay at all. What is lost here is the node-local export
-	// path, not the ateworker's ability to run actors, and failing the worker pod
-	// over its telemetry route would turn a misconfigured flag into an outage.
-	relayConn, err := otlprelay.Dial(ctx, *otlpRelaySocket)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to connect to the OTLP relay; falling back to the OTLP endpoint, if one is set",
-			slog.String("socket", *otlpRelaySocket), slog.Any("err", err))
+	//   - Colocated: export through atelet's node-local Unix relay when it is
+	//     there; a nil conn means it is not, and the providers fall back to
+	//     OTEL_EXPORTER_OTLP_ENDPOINT and export nothing without one. That
+	//     fallback is deliberate here -- the worker already shares the node, so
+	//     a direct export is no wider a surface, and failing the worker over an
+	//     absent socket would be an outage for no gain.
+	//
+	//   - Network: export over the SAME authenticated, identity-pinned atelet
+	//     TCP connection the worker reaches WorkerSupport on (atelet authorizes
+	//     the OTLP Export methods for a network worker). A separate guest's
+	//     whole point is isolation, so telemetry must NOT fall back to the
+	//     worker pod's own data network. The conn is lazy, so a dial failure is
+	//     a malformed flag (a deploy bug), which fails the boot closed rather
+	//     than selecting the direct route.
+	var relayConn *grpc.ClientConn
+	if networkEnabled() {
+		// The atelet connection is a lazy grpc.NewClient (workertransport.Dial),
+		// so this only errors on a malformed address or credential material --
+		// a deploy bug in the controller-supplied flags, not a transient
+		// reachability failure. In network mode telemetry must stay on this
+		// authenticated, identity-pinned link and must NOT fall back to the
+		// worker pod's own data network, so a genuine configuration error fails
+		// the boot (fail closed) rather than selecting a less constrained
+		// route. When it succeeds the lazy conn remains the exporter connection
+		// even if atelet is briefly unreachable: the SDK queues and retries,
+		// with no direct fallback.
+		relayConn, err = dialAtelet(tunnelConfig.CredentialBundle, tunnelConfig.TrustBundle, tunnelConfig.BrokerIdentity)
+		if err != nil {
+			return fmt.Errorf("network worker telemetry relay: %w", err)
+		}
+	} else {
+		// Colocated: export through atelet's node-local Unix relay when it is
+		// there. A relay that cannot be dialed is logged rather than fatal --
+		// an absent socket is a documented fallback to the OTLP endpoint, not an
+		// error, and failing the worker over its telemetry route would turn a
+		// misconfigured socket into an outage.
+		relayConn, err = otlprelay.Dial(ctx, *otlpRelaySocket)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to connect to the OTLP relay; falling back to the OTLP endpoint, if one is set",
+				slog.String("socket", *otlpRelaySocket), slog.Any("err", err))
+		}
 	}
 	if relayConn != nil {
 		defer relayConn.Close()
@@ -241,21 +298,34 @@ func do(ctx context.Context) error {
 	}
 	removeStaleCheckpointCgroups(ctx, defaultCgroupRoot)
 
-	// Clean up any old socket.
+	// Default (colocated) mode serves the Worker service over the node-local
+	// Unix socket, reached by atelet through the shared filesystem. Clean up
+	// any old socket and open it. In network mode (both flags set), the worker
+	// runs in a separate guest Pod with no shared filesystem, so it serves over
+	// a TCP mTLS listener instead; no Unix socket is created or removed. The
+	// listener and the removal are chosen together so a network worker never
+	// touches the shared-filesystem socket path.
 	sockPath := nodepath.WorkerSocketPath(*podUID)
-	if err := os.RemoveAll(sockPath); err != nil {
-		return fmt.Errorf("while removing %q: %w", sockPath, err)
-	}
-
-	lis, err := net.Listen("unix", sockPath)
-	if err != nil {
-		return fmt.Errorf("while opening unix socket: %w", err)
-	}
-	defer func() {
-		if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.ErrorContext(ctx, "Failed to remove the ateworker socket on shutdown", slog.Any("err", err))
+	var lis net.Listener
+	if networkEnabled() {
+		lis, err = net.Listen("tcp", *workerListenAddress)
+		if err != nil {
+			return fmt.Errorf("while opening network worker listener on %q: %w", *workerListenAddress, err)
 		}
-	}()
+	} else {
+		if err := os.RemoveAll(sockPath); err != nil {
+			return fmt.Errorf("while removing %q: %w", sockPath, err)
+		}
+		lis, err = net.Listen("unix", sockPath)
+		if err != nil {
+			return fmt.Errorf("while opening unix socket: %w", err)
+		}
+		defer func() {
+			if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				slog.ErrorContext(ctx, "Failed to remove the ateworker socket on shutdown", slog.Any("err", err))
+			}
+		}()
+	}
 
 	flags, err := newFlagStore(ctx, flagsConfigPath())
 	if err != nil {
@@ -263,7 +333,13 @@ func do(ctx context.Context) error {
 	}
 
 	actorLogger := actorlog.NewActorLogger(syncedWriter, metadata.OnGCE())
-	tunnel, err := atunnel.Start(ctx, *tunnelConfig, actornet.ActorHTTPUpstream)
+	// Build the tunnel config from the parsed flags, wiring the atelet address
+	// so the credential broker and egress-policy fetch reach atelet the same
+	// way register does (see applyNetworkTunnelConfig). do() must use the
+	// RESULT of this call, not *tunnelConfig, or the network worker would dial
+	// nothing over TCP.
+	startConfig := applyNetworkTunnelConfig(*tunnelConfig, *ateletAddress)
+	tunnel, err := atunnel.Start(ctx, startConfig, actornet.ActorHTTPUpstream)
 	if err != nil {
 		return err
 	}
@@ -285,11 +361,21 @@ func do(ctx context.Context) error {
 		go ateworkerService.watchMemory(ctx)
 	}
 
-	svr := grpc.NewServer(
-		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.UnaryInterceptor(ateinterceptors.InternalServerUnaryInterceptor),
-	)
+	var netServing *networkServing
+	if networkEnabled() {
+		netServing, err = buildNetworkServing(
+			tunnelConfig.CredentialBundle, tunnelConfig.TrustBundle, tunnelConfig.BrokerIdentity,
+			nodepath.BasePath, *podUID, func(uid string) bool { return ateworkerService.lookupActor(uid) != nil },
+		)
+		if err != nil {
+			return err
+		}
+	}
+	svr := grpc.NewServer(workerServerOptions(netServing)...)
 	ateworkerpb.RegisterWorkerServer(svr, ateworkerService)
+	if netServing != nil {
+		workerstagingpb.RegisterWorkerStagingServer(svr, netServing.staging)
+	}
 	reflection.Register(svr)
 	readiness := &serverboot.Readiness{}
 	readiness.AddCheck("registered", ateworkerService.epoch.Registered)
@@ -317,7 +403,11 @@ func do(ctx context.Context) error {
 	// the Worker record exists; anything that reaches here is a misconfiguration
 	// no restart-in-place will fix.
 	reportConfig := register.ReportConfig{
-		SocketPath:           nodepath.WorkerSupportSocket,
+		SocketPath: nodepath.WorkerSupportSocket,
+		// Empty in colocated mode, so Report keeps the Unix-socket dial;
+		// set in network mode, so it dials the atelet-workers Service over
+		// TCP mTLS instead.
+		Address:              *ateletAddress,
 		CredentialBundlePath: tunnelConfig.CredentialBundle,
 		TrustBundlePath:      tunnelConfig.TrustBundle,
 		AteletSPIFFEID:       tunnelConfig.BrokerIdentity,
@@ -346,6 +436,50 @@ func do(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// workerServerOptions assembles the gRPC server options for the worker in both
+// modes from one place, so the final list passed to grpc.NewServer has exactly
+// one unary interceptor and the authorization ordering is explicit.
+//
+// Colocated (netServing == nil): the Unix socket carries the same trust as the
+// shared filesystem, so no transport credentials or authorizers are added.
+// These are exactly the two colocated options -- a stats handler and the
+// Internal logging/error-mapping unary interceptor.
+//
+// Network (netServing != nil): the worker serves over a TCP mTLS listener to a
+// peer in a separate guest Pod, so it adds the network transport options
+// (mTLS creds pinned to the node atelet, a receive-size cap, and the STREAM
+// authorizer) and ONE unary chain. grpc-go makes the single UnaryInterceptor /
+// ChainUnaryInterceptor the OUTERMOST unary wrapper with its entries running in
+// listed order, so the chain is deliberately ordered authorizer first:
+//
+//	UnaryAuthorizer          -- refuses a method outside the worker lifecycle/
+//	                            staging allowlist BEFORE anything else sees it;
+//	InternalServerUnaryInterceptor -- logs the request/response and maps errors,
+//	                            so it never logs a call the authorizer refused;
+//	staging.LifecycleInterceptor -- bounds what a staging RPC may touch.
+//
+// Setting grpc.UnaryInterceptor both inside netServing AND again in
+// the base options; grpc-go permits UnaryInterceptor only once and panics in
+// grpc.NewServer on the second, which would crash the network worker at startup.
+// Collapsing the unary interceptors into this single ChainUnaryInterceptor is
+// what makes that unrepresentable.
+func workerServerOptions(netServing *networkServing) []grpc.ServerOption {
+	if netServing == nil {
+		return []grpc.ServerOption{
+			grpc.StatsHandler(otelgrpc.NewServerHandler()),
+			grpc.UnaryInterceptor(ateinterceptors.InternalServerUnaryInterceptor),
+		}
+	}
+	options := []grpc.ServerOption{grpc.StatsHandler(otelgrpc.NewServerHandler())}
+	options = append(options, netServing.transportOptions...)
+	options = append(options, grpc.ChainUnaryInterceptor(
+		workertransport.UnaryAuthorizer(authorizeAteletCall),
+		ateinterceptors.InternalServerUnaryInterceptor,
+		netServing.staging.LifecycleInterceptor(),
+	))
+	return options
 }
 
 const (
