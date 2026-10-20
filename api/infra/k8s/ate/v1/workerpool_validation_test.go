@@ -281,6 +281,27 @@ func TestWorkerPoolValidation(t *testing.T) {
 			wp.Spec.Template = gpuTemplate(corev1.ResourceList{gpuResourceName: resource.MustParse("1")}, nil)
 		},
 		wantErr: false,
+	}, {
+		// Network transport runs workers in a separate guest on an isolating
+		// runtime class; it is a gVisor sandbox concept. The
+		// base pool is gvisor, so this is accepted.
+		name: "networkTransport with the gvisor class",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.NetworkTransport = &WorkerPoolNetworkTransport{RuntimeClassName: "kata-fc"}
+		},
+		wantErr: false,
+	}, {
+		// A microVM worker is colocated (kata + cloud-hypervisor) and gets a
+		// /dev/net/tun hostPath that network shaping does not strip; the
+		// combination is meaningless and is rejected at admission so the
+		// controller never has to shape such a pod.
+		name: "networkTransport with the microvm class is rejected",
+		mutate: func(wp *WorkerPool) {
+			wp.Spec.SandboxClasses = []WorkerPoolSandboxClass{{Name: SandboxClassMicroVM}}
+			wp.Spec.NetworkTransport = &WorkerPoolNetworkTransport{RuntimeClassName: "kata-fc"}
+		},
+		wantErr: true,
+		errMsg:  "networkTransport is only supported with the gvisor sandbox class",
 	}}
 
 	for _, tt := range tests {

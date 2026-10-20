@@ -44,6 +44,9 @@ const (
 	// GateNestedContainers controls whether an actor may opt into running a
 	// nested container stack inside its gVisor sandbox.
 	GateNestedContainers Gate = "NestedContainers"
+	// GateNetworkWorkers controls whether a worker pool may run its workers as
+	// separate guest Pods reached over authenticated Pod networking.
+	GateNetworkWorkers Gate = "NetworkWorkers"
 
 	// GateGoldenEgressPolicy controls configuring a golden actor's egress policy on its template.
 	GateGoldenEgressPolicy Gate = "GoldenEgressPolicy"
@@ -64,6 +67,7 @@ var realKnownGates = []Gate{
 	GateExternalVolumes,
 	GateGoldenEgressPolicy,
 	GateNestedContainers,
+	GateNetworkWorkers,
 	GatePerTemplateSnapshotLocation,
 }
 

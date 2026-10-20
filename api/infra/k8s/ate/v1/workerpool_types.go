@@ -85,6 +85,7 @@ type WorkerPoolPodTemplate struct {
 	ServiceAccountName *string `json:"serviceAccountName,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.networkTransport) || self.sandboxClasses.all(c, c.name == 'gvisor')",message="networkTransport is only supported with the gvisor sandbox class"
 type WorkerPoolSpec struct {
 	// replicas is the number of worker pods to run.
 	// +required
@@ -101,6 +102,23 @@ type WorkerPoolSpec struct {
 	// +optional
 	Template *WorkerPoolPodTemplate `json:"template,omitempty"`
 
+	// networkTransport runs the pool's workers as separate guest Pods reached
+	// over authenticated Pod networking instead of the node's shared host
+	// filesystem and Unix sockets. It is what lets a worker Pod be
+	// placed on an isolating guest runtime class: a colocated worker shares
+	// the node filesystem and cannot run in a separate guest.
+	//
+	// When set the controller gives the worker pods the named RuntimeClass,
+	// marks them with the reserved ate.dev/worker-transport=network label the
+	// node directory authorizes a network worker by, and drops the shared
+	// node-filesystem hostPath mount a colocated worker depends on.
+	//
+	// nil (the default) keeps colocated transport and leaves the worker pod
+	// shape byte-for-byte unchanged.
+	//
+	// +optional
+	NetworkTransport *WorkerPoolNetworkTransport `json:"networkTransport,omitempty"`
+
 	// sandboxClasses lists the sandbox runtime families this pool runs. Exactly
 	// one entry is allowed today. The names cannot change after creation.
 	//
@@ -111,6 +129,22 @@ type WorkerPoolSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	SandboxClasses []WorkerPoolSandboxClass `json:"sandboxClasses,omitempty"`
+}
+
+// WorkerPoolNetworkTransport configures running a pool's workers as separate
+// guest Pods reached over authenticated Pod networking.
+type WorkerPoolNetworkTransport struct {
+	// runtimeClassName is the Kubernetes RuntimeClass the worker pods run
+	// under. A network worker runs in a separate guest, so it needs an
+	// isolating runtime class. The
+	// name must reference a RuntimeClass that exists on the cluster. It is
+	// required: network transport exists to place workers on such a class, so
+	// an empty value has no meaning.
+	//
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	RuntimeClassName string `json:"runtimeClassName,omitempty"`
 }
 
 // WorkerPoolSandboxClass is one sandbox runtime family a WorkerPool runs.

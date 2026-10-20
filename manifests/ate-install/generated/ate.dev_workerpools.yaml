@@ -74,6 +74,36 @@ spec:
           spec:
             description: spec defines the desired state of WorkerPool
             properties:
+              networkTransport:
+                description: |-
+                  networkTransport runs the pool's workers as separate guest Pods reached
+                  over authenticated Pod networking instead of the node's shared host
+                  filesystem and Unix sockets. It is what lets a worker Pod be
+                  placed on an isolating guest runtime class: a colocated worker shares
+                  the node filesystem and cannot run in a separate guest.
+
+                  When set the controller gives the worker pods the named RuntimeClass,
+                  marks them with the reserved ate.dev/worker-transport=network label the
+                  node directory authorizes a network worker by, and drops the shared
+                  node-filesystem hostPath mount a colocated worker depends on.
+
+                  nil (the default) keeps colocated transport and leaves the worker pod
+                  shape byte-for-byte unchanged.
+                properties:
+                  runtimeClassName:
+                    description: |-
+                      runtimeClassName is the Kubernetes RuntimeClass the worker pods run
+                      under. A network worker runs in a separate guest, so it needs an
+                      isolating runtime class. The
+                      name must reference a RuntimeClass that exists on the cluster. It is
+                      required: network transport exists to place workers on such a class, so
+                      an empty value has no meaning.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                required:
+                - runtimeClassName
+                type: object
               replicas:
                 description: replicas is the number of worker pods to run.
                 format: int32
@@ -490,6 +520,11 @@ spec:
             - sandboxClasses
             - workerImage
             type: object
+            x-kubernetes-validations:
+            - message: networkTransport is only supported with the gvisor sandbox
+                class
+              rule: '!has(self.networkTransport) || self.sandboxClasses.all(c, c.name
+                == ''gvisor'')'
           status:
             description: status is the observed state of WorkerPool
             properties:
