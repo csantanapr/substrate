@@ -204,6 +204,70 @@ func TestRenderSubstrateFixtures_MicroVM(t *testing.T) {
 	}
 }
 
+// TestRenderSubstrateFixtures_NetworkTransport pins the network lane's
+// rendering: the pool keeps the gVisor class and worker, gains
+// networkTransport with the lane's RuntimeClass, and both halves of a fixture
+// carry the lane's own suffix, so the template still lands in its pool's
+// atespace (which ends in -network-render) and selects that pool rather than
+// the gVisor lane's.
+func TestRenderSubstrateFixtures_NetworkTransport(t *testing.T) {
+	t.Setenv(sandboxClassEnv, "")
+	t.Setenv(workerTransportEnv, WorkerTransportNetwork)
+	for _, fixture := range substrateFixtures {
+		t.Run(fixture.manifests.Pool, func(t *testing.T) {
+			pool := renderPool(t, fixture.manifests.Pool)
+			if !strings.HasSuffix(pool.Spec.WorkerImage, "/cmd/ateworker-gvisor") {
+				t.Errorf("WorkerPool workerImage = %q, want the gVisor worker", pool.Spec.WorkerImage)
+			}
+			if pool.Spec.DefaultSandboxClass() != atev1.SandboxClassGvisor {
+				t.Errorf("WorkerPool runtime = class %q, want gvisor", pool.Spec.DefaultSandboxClass())
+			}
+			if nt := pool.Spec.NetworkTransport; nt == nil || nt.RuntimeClassName != NetworkRuntimeClass {
+				t.Errorf("WorkerPool networkTransport = %+v, want runtimeClassName %q", nt, NetworkRuntimeClass)
+			}
+			if !strings.HasSuffix(pool.Namespace, "-network-render") {
+				t.Errorf("WorkerPool namespace = %q, want the network lane's suffix", pool.Namespace)
+			}
+
+			templates := renderTemplates(t, fixture.manifests.Template, fixture.values)
+			if len(templates) != fixture.templates {
+				t.Fatalf("rendered %s yields %d templates, want %d", fixture.manifests.Template, len(templates), fixture.templates)
+			}
+			for _, tmpl := range templates {
+				name := tmpl.GetMetadata().GetName()
+				if got := tmpl.GetMetadata().GetAtespace(); got != pool.Namespace {
+					t.Errorf("template %s atespace = %q, want its pool's namespace %q", name, got, pool.Namespace)
+				}
+				for k, v := range tmpl.GetWorkerSelector().GetMatchLabels() {
+					if pool.Labels[k] != v {
+						t.Errorf("template %s selects %s=%s, which the pool's labels %v do not carry", name, k, v, pool.Labels)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestLaneConfigError pins the one lane pairing preflight rejects before it
+// talks to the cluster, and that each lane on its own passes.
+func TestLaneConfigError(t *testing.T) {
+	for _, tc := range []struct {
+		class, transport string
+		wantErr          bool
+	}{
+		{"", "", false},
+		{SandboxClassMicroVM, "", false},
+		{"", WorkerTransportNetwork, false},
+		{SandboxClassMicroVM, WorkerTransportNetwork, true},
+	} {
+		t.Setenv(sandboxClassEnv, tc.class)
+		t.Setenv(workerTransportEnv, tc.transport)
+		if err := laneConfigError(); (err != nil) != tc.wantErr {
+			t.Errorf("class=%q transport=%q: laneConfigError() = %v, want error %v", tc.class, tc.transport, err, tc.wantErr)
+		}
+	}
+}
+
 // TestEgressFixture covers the knob the networking suite reads: the class
 // picks the fixture.
 func TestEgressFixture(t *testing.T) {

@@ -41,6 +41,30 @@ func IsMicroVM() bool { return SandboxClass() == SandboxClassMicroVM }
 // IsAgentGateway reports whether the suites run against the agentgateway lane.
 func IsAgentGateway() bool { return os.Getenv(AtenetDataplaneEnv) == "agentgateway" }
 
+// WorkerTransportNetwork is the E2E_WORKER_TRANSPORT value that puts the
+// pools' workers in their own guest Pods, reached over Pod networking.
+const WorkerTransportNetwork = "network"
+
+// workerTransportEnv selects the transport the fixtures' workers run under.
+// It is orthogonal to sandboxClassEnv because spec.networkTransport is a
+// sibling of spec.sandboxClasses, not one of its values. Unset means the
+// colocated transport every suite ran under before this lane existed.
+//
+// Only the fixtures RenderFixtureManifest renders follow it. The counter and
+// egress demos (SubstrateCounterFixture, EgressFixture) are installed once and
+// stay colocated, so the suites built on them (networking, metrics'
+// TestPlatformMetricsEmitted, demo's TestWorkerSecurityFilesystem) do not
+// exercise network transport under this lane. See README.md.
+const workerTransportEnv = "E2E_WORKER_TRANSPORT"
+
+// NetworkRuntimeClass is the RuntimeClass the network lane's worker Pods run
+// under. hack/install-kata-runtimeclass.sh installs it under this name.
+const NetworkRuntimeClass = "kata"
+
+// IsNetworkTransport reports whether the suites are pointed at network-transport
+// fixtures, whose workers run as separate guest Pods under NetworkRuntimeClass.
+func IsNetworkTransport() bool { return os.Getenv(workerTransportEnv) == WorkerTransportNetwork }
+
 // Fixture identifies an installed WorkerPool + ActorTemplate pair (both carry
 // the same name) that suites either create Actors from directly or copy the
 // resolved runtime — sandbox class, worker image, container images — out of.
@@ -123,13 +147,17 @@ func EgressFixture() Fixture {
 	}
 }
 
-// FixtureName suffixes a fixture's name for the sandbox class under test, so
-// the gVisor and micro-VM lanes never share one. That matters most for the
-// namespaces a suite creates and deletes itself: the two lanes run one after
-// the other, and a namespace still Terminating from the previous one would
-// fail the next one's apply. ${FIXTURE_SUFFIX} does the same job inside the
-// fixture manifests.
+// FixtureName suffixes a fixture's name for the lane under test, so no two
+// lanes share one. That matters most for the namespaces a suite creates and
+// deletes itself: the lanes run one after the other, and a namespace still
+// Terminating from the previous one would fail the next one's apply. The
+// network lane needs its own suffix even though it keeps the gVisor sandbox
+// class, or it would collide with the gVisor lane. ${FIXTURE_SUFFIX} does the
+// same job inside the fixture manifests.
 func FixtureName(base string) string {
+	if IsNetworkTransport() {
+		return base + "-" + WorkerTransportNetwork
+	}
 	if IsMicroVM() {
 		return base + "-" + SandboxClassMicroVM
 	}
@@ -139,11 +167,13 @@ func FixtureName(base string) string {
 // TemplateReadyTimeout is how long to wait for an ActorTemplate's golden
 // snapshot. A micro-VM golden (a cloud-hypervisor cold boot plus checkpoint, on
 // nested KVM in CI) takes several times what a gVisor one does, so the default
-// follows the class under test. E2E_TEMPLATE_READY_TIMEOUT overrides it.
+// follows the lane under test. The network lane takes a gVisor golden, but the
+// worker it runs on has to boot a RuntimeClass guest first.
+// E2E_TEMPLATE_READY_TIMEOUT overrides it.
 func TemplateReadyTimeout(t *testing.T) time.Duration {
 	t.Helper()
 	d := 90 * time.Second
-	if IsMicroVM() {
+	if IsMicroVM() || IsNetworkTransport() {
 		d = 10 * time.Minute
 	}
 	if v := os.Getenv("E2E_TEMPLATE_READY_TIMEOUT"); v != "" {
@@ -189,6 +219,15 @@ func fixtureSubstitutions(name string) (inline, blocks map[string]string) {
 		"${WORKERPOOL_RUNTIME}": "  sandboxClasses:\n  - name: gvisor",
 		// Off unless the caller opts in; see WithTrustBundle.
 		"${TEMPLATE_TRUST_BUNDLE}": "",
+	}
+	if IsNetworkTransport() {
+		// Network transport runs gVisor inside the RuntimeClass guest, so the
+		// sandbox class and worker image stay the gVisor ones. Only the
+		// transport and the fixture names change.
+		inline["${FIXTURE_SUFFIX}"] = "-" + WorkerTransportNetwork + "-" + name
+		blocks["${WORKERPOOL_RUNTIME}"] = "  sandboxClasses:\n  - name: gvisor\n" +
+			"  networkTransport:\n    runtimeClassName: " + NetworkRuntimeClass
+		return inline, blocks
 	}
 	if !IsMicroVM() {
 		return inline, blocks

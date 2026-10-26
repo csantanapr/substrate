@@ -51,6 +51,21 @@ $ go run ./cmd/ate-setup --kind deploy demo counter-microvm # counter-microvm
 $ go run ./cmd/ate-setup --kind deploy demo egress-microvm  # egress-microvm
 ```
 
+## Worker transport
+
+`E2E_WORKER_TRANSPORT=network` runs the suites with the fixtures they render
+themselves (`e2e.RenderFixtureManifest`) as network-transport pools: the
+gVisor class, with `spec.networkTransport` and the `kata` RuntimeClass that
+`hack/install-kata-runtimeclass.sh --install` adds to a kind cluster with
+`/dev/kvm`. It cannot be combined with `E2E_SANDBOX_CLASS=microvm`.
+
+The counter and egress demos are not rendered per lane, so the suites that use
+`e2e.SubstrateCounterFixture` or `e2e.EgressFixture` still run against
+colocated pools under this lane and do not exercise network transport: the
+`networking` suite (every test that reaches the egress or counter demo), the
+`metrics` suite's TestPlatformMetricsEmitted and the `demo` suite's
+TestWorkerSecurityFilesystem.
+
 A handful of knobs override the class defaults, mostly for a cluster that
 installs the fixtures elsewhere: `E2E_SUBSTRATE_TEMPLATE_ATESPACE` /
 `E2E_SUBSTRATE_TEMPLATE_NAME` / `E2E_SUBSTRATE_POOL_NAMESPACE` /

@@ -51,6 +51,12 @@ func substrateTemplateSubstitutions(name string, trustBundles []string) (inline,
 		}
 		blocks["${TEMPLATE_TRUST_BUNDLE}"] = block + "        path: trust-bundle.pem"
 	}
+	if IsNetworkTransport() {
+		// Same suffix as fixtureSubstitutions gives the pool half, so the
+		// template's atespace and worker selector still name its own pool.
+		inline["${FIXTURE_SUFFIX}"] = "-" + WorkerTransportNetwork + "-" + name
+		return inline, blocks
+	}
 	if !IsMicroVM() {
 		return inline, blocks
 	}

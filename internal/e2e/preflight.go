@@ -17,6 +17,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +28,10 @@ import (
 // PreflightChecks checks that the test environment is ready for the test suite.
 func PreflightChecks() error {
 	ctx := context.Background()
+
+	if err := laneConfigError(); err != nil {
+		return err
+	}
 
 	clients := GetClients()
 
@@ -73,5 +78,29 @@ func PreflightChecks() error {
 		}
 	}
 
+	// The lane needs its RuntimeClass; without it no worker Pod is admitted.
+	if IsNetworkTransport() {
+		fmt.Fprintf(os.Stderr, "%s=%s: only the fixtures the suites render are network pools; "+
+			"suites on the counter and egress demos still run on colocated pools (see internal/e2e/README.md)\n",
+			workerTransportEnv, WorkerTransportNetwork)
+		if _, err := clients.K8s.NodeV1().RuntimeClasses().Get(ctx, NetworkRuntimeClass, metav1.GetOptions{}); err != nil {
+			return fmt.Errorf("%s=%s but RuntimeClass/%s is missing (install it with hack/install-kata-runtimeclass.sh --install): %w",
+				workerTransportEnv, WorkerTransportNetwork, NetworkRuntimeClass, err)
+		}
+	}
+
+	return nil
+}
+
+// laneConfigError rejects an E2E_* lane selection that has no working
+// configuration, before anything talks to the cluster. Network transport runs
+// gVisor inside the RuntimeClass guest. Nesting the micro-VM class inside that
+// guest needs a /dev/kvm the guest does not have, so the pairing has nothing to
+// select.
+func laneConfigError() error {
+	if IsNetworkTransport() && IsMicroVM() {
+		return fmt.Errorf("%s=%s cannot be combined with %s=%s: network transport runs the gVisor class inside the guest",
+			workerTransportEnv, WorkerTransportNetwork, sandboxClassEnv, SandboxClassMicroVM)
+	}
 	return nil
 }
