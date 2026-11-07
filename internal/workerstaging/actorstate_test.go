@@ -208,6 +208,35 @@ func TestActorStateRequiresBothTrees(t *testing.T) {
 	}
 }
 
+// TestExtractKeepsDirectorySpecialBits extracts a directory with the sticky
+// bit, like an image's /tmp (1777), and a setgid one: both are created and
+// keep their mode.
+func TestExtractKeepsDirectorySpecialBits(t *testing.T) {
+	dir := t.TempDir()
+	headers := []*tar.Header{
+		{Name: actorTreeName() + "/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: actorTreeName() + "/durable-dir", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: actorTreeName() + "/durable-dir/tmp", Typeflag: tar.TypeDir, Mode: 0o1777},
+		{Name: actorTreeName() + "/durable-dir/shared", Typeflag: tar.TypeDir, Mode: 0o2775},
+		{Name: snapshotsTreeName() + "/", Typeflag: tar.TypeDir, Mode: 0o755},
+	}
+	if err := extractArtifact(t.Context(), actorStateArtifact(), dir, bytes.NewReader(archiveFixture(t, headers))); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	for name, want := range map[string]os.FileMode{
+		"tmp":    os.ModeDir | os.ModeSticky | 0o777,
+		"shared": os.ModeDir | os.ModeSetgid | 0o775,
+	} {
+		info, err := os.Stat(filepath.Join(dir, actorTreeName(), "durable-dir", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode(); got != want {
+			t.Errorf("%s mode = %v, want %v", name, got, want)
+		}
+	}
+}
+
 // TestCommitEmptySnapshotsTreeLeavesNothing commits an activation whose
 // snapshots tree is empty (nothing staged for restore or checkpoint): the actor
 // tree is placed, and no snapshots/<uid> directory is left behind.

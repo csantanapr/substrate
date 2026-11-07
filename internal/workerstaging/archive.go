@@ -390,7 +390,10 @@ func extractArtifact(ctx context.Context, artifact *pb.Artifact, directory strin
 		mode := header.FileInfo().Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := root.MkdirAll(name, mode|0o700); err != nil {
+			// os.Root's mkdir takes permission bits only; the setuid, setgid
+			// and sticky bits (an image's /tmp is 1777) come back with the
+			// Chmod after extraction.
+			if err := root.MkdirAll(name, mode&os.ModePerm|0o700); err != nil {
 				return err
 			}
 			dirs[name] = mode
