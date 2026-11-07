@@ -157,11 +157,11 @@ func ateBaseMountsOf(ps *corev1ac.PodSpecApplyConfiguration) []corev1ac.VolumeMo
 // TestNetworkTransportReplacesHostPathWithEmptyDir proves the ate-base volume is
 // REPLACED, not dropped, for a network worker: the shared node-filesystem
 // hostPath is gone (a separate guest shares nothing from the node), and in its
-// place is a writable emptyDir of the DEFAULT medium mounted at the same path
-// (nodepath.BasePath). That real, non-overlayfs directory is what lets the
-// worker mount per-container overlay rootfs upperdirs under BasePath inside the
-// guest; without it the upperdir would land on the container's own overlayfs
-// root, and the kernel refuses an overlay upperdir on overlayfs.
+// place is a writable emptyDir of medium Memory mounted at the same path
+// (nodepath.BasePath). That guest tmpfs is what lets the worker mount
+// per-container overlay rootfs upperdirs under BasePath inside the guest;
+// without it the upperdir would land on the container's own overlayfs root or
+// on Kata's virtio-fs share, and the kernel refuses both as an upperdir.
 // A colocated worker keeps the hostPath untouched.
 func TestNetworkTransportReplacesHostPathWithEmptyDir(t *testing.T) {
 	t.Run("network worker satisfies the full ate-base invariant", func(t *testing.T) {
@@ -169,12 +169,12 @@ func TestNetworkTransportReplacesHostPathWithEmptyDir(t *testing.T) {
 		// is non-vacuous. If this passes, every clause (count, emptyDir, default
 		// medium, no sizeLimit, no hostPath, one writable mount at BasePath)
 		// holds. The detailed sub-assertions below are kept for diagnosis.
-		if reason := ateBaseIsDefaultEmptyDirAtBasePath(networkPodSpec(t, buildNetworkPool(nil))); reason != "" {
+		if reason := ateBaseIsMemoryEmptyDirAtBasePath(networkPodSpec(t, buildNetworkPool(nil))); reason != "" {
 			t.Fatalf("network worker fails the ate-base invariant: %s", reason)
 		}
 	})
 
-	t.Run("network worker: exactly one ate-base emptyDir (default medium), no hostPath", func(t *testing.T) {
+	t.Run("network worker: exactly one ate-base emptyDir (medium Memory), no hostPath", func(t *testing.T) {
 		ps := networkPodSpec(t, buildNetworkPool(nil))
 
 		// Exactly one volume named ate-base, and it is an emptyDir, not a
@@ -196,15 +196,11 @@ func TestNetworkTransportReplacesHostPathWithEmptyDir(t *testing.T) {
 		if v.EmptyDir == nil {
 			t.Fatalf("network worker ate-base is not an emptyDir; got %+v", v)
 		}
-		// Default medium: by the Kubernetes contract empty/unset Medium uses the
-		// storage backing the kubelet root directory, not a tmpfs (medium
-		// Memory). We require the default, non-Memory medium only to avoid a
-		// tmpfs backing we have not proven; the actual separation from the
-		// container overlay is a runtime fact of the sandbox the live run confirms, not a
-		// default-medium guarantee. (No claim that overlayfs rejects a tmpfs
-		// upperdir; current kernels accept one.)
-		if v.EmptyDir.Medium != nil && *v.EmptyDir.Medium != "" {
-			t.Errorf("network worker ate-base emptyDir medium = %q, want default (non-Memory) backing", *v.EmptyDir.Medium)
+		// Medium Memory: a tmpfs in the guest, which overlayfs accepts as an
+		// upperdir. The default medium lands on Kata's virtio-fs share, which it
+		// refuses.
+		if v.EmptyDir.Medium == nil || *v.EmptyDir.Medium != corev1.StorageMediumMemory {
+			t.Errorf("network worker ate-base emptyDir medium = %v, want Memory", v.EmptyDir.Medium)
 		}
 		// No deliberate sizeLimit: assets, image layers and actor state land
 		// here and a small cap would evict them mid-actor.
@@ -297,7 +293,7 @@ func TestNetworkTransportVolumeIdempotent(t *testing.T) {
 	}
 }
 
-// ateBaseIsDefaultEmptyDirAtBasePath is THE invariant a network worker's
+// ateBaseIsMemoryEmptyDirAtBasePath is THE invariant a network worker's
 // ate-base volume must satisfy, factored out so the positive test
 // (TestNetworkTransportReplacesHostPathWithEmptyDir) and the rejection test
 // (TestNetworkTransportVolumeInvariantRejectsMutants) exercise the SAME complete
@@ -307,9 +303,9 @@ func TestNetworkTransportVolumeIdempotent(t *testing.T) {
 // positive assertion. Returns "" when the pod satisfies every clause, else the
 // first clause it fails. The clauses mirror, one for one, the properties of the
 // pod shape: exactly one ate-base, an emptyDir (not hostPath) of
-// default medium with no sizeLimit, no other hostPath on the pod, and exactly
+// medium Memory with no sizeLimit, no other hostPath on the pod, and exactly
 // one writable mount at nodepath.BasePath.
-func ateBaseIsDefaultEmptyDirAtBasePath(ps *corev1ac.PodSpecApplyConfiguration) string {
+func ateBaseIsMemoryEmptyDirAtBasePath(ps *corev1ac.PodSpecApplyConfiguration) string {
 	n := 0
 	for _, v := range ps.Volumes {
 		if v.Name != nil && *v.Name == "ate-base" {
@@ -329,13 +325,10 @@ func ateBaseIsDefaultEmptyDirAtBasePath(ps *corev1ac.PodSpecApplyConfiguration) 
 	if v.EmptyDir == nil {
 		return "ate-base is not an emptyDir"
 	}
-	// Default medium -- NOT Memory (tmpfs). By the Kubernetes contract default
-	// uses kubelet-root-backing storage; we require it only to avoid an
-	// unproven tmpfs backing. (No claim that overlayfs rejects a tmpfs upperdir;
-	// the container-overlay separation is a runtime fact of the sandbox the live run
-	// confirms, not a default-medium guarantee.)
-	if v.EmptyDir.Medium != nil && *v.EmptyDir.Medium != "" {
-		return "ate-base emptyDir medium is not default (must not be Memory)"
+	// Medium Memory: a tmpfs in the guest. The default medium lands on Kata's
+	// virtio-fs share, which overlayfs refuses as an upperdir.
+	if v.EmptyDir.Medium == nil || *v.EmptyDir.Medium != corev1.StorageMediumMemory {
+		return "ate-base emptyDir medium is not Memory"
 	}
 	// No sizeLimit: a small cap would evict assets/layers/actor state mid-actor.
 	if v.EmptyDir.SizeLimit != nil {
@@ -367,7 +360,7 @@ func ateBaseIsDefaultEmptyDirAtBasePath(ps *corev1ac.PodSpecApplyConfiguration) 
 // these broken cases would pass and this test would fail.
 func TestNetworkTransportVolumeInvariantRejectsMutants(t *testing.T) {
 	// Accepts the real pod.
-	if reason := ateBaseIsDefaultEmptyDirAtBasePath(networkPodSpec(t, buildNetworkPool(nil))); reason != "" {
+	if reason := ateBaseIsMemoryEmptyDirAtBasePath(networkPodSpec(t, buildNetworkPool(nil))); reason != "" {
 		t.Fatalf("invariant rejected the real network pod: %s", reason)
 	}
 
@@ -378,7 +371,7 @@ func TestNetworkTransportVolumeInvariantRejectsMutants(t *testing.T) {
 		ps.Volumes = slices.DeleteFunc(ps.Volumes, func(v corev1ac.VolumeApplyConfiguration) bool {
 			return v.Name != nil && *v.Name == "ate-base"
 		})
-		if reason := ateBaseIsDefaultEmptyDirAtBasePath(ps); reason == "" {
+		if reason := ateBaseIsMemoryEmptyDirAtBasePath(ps); reason == "" {
 			t.Error("invariant accepted a network pod with the ate-base volume removed; it must reject it")
 		}
 	})
@@ -395,24 +388,22 @@ func TestNetworkTransportVolumeInvariantRejectsMutants(t *testing.T) {
 		v.WithHostPath(corev1ac.HostPathVolumeSource().
 			WithPath(nodepath.BasePath).
 			WithType(corev1.HostPathDirectoryOrCreate))
-		if reason := ateBaseIsDefaultEmptyDirAtBasePath(ps); reason == "" {
+		if reason := ateBaseIsMemoryEmptyDirAtBasePath(ps); reason == "" {
 			t.Error("invariant accepted a network pod whose ate-base is a hostPath; it must reject it")
 		}
 	})
 
-	// Case 3: the emptyDir is medium Memory (tmpfs) -- a backing we have not
-	// proven, unlike the default (non-Memory) medium the live re-proof
-	// confirmed. The invariant must reject it. (This does NOT assert overlayfs
-	// rejects a tmpfs upperdir; it asserts the medium must stay default.)
-	t.Run("rejects a pod whose ate-base emptyDir is medium Memory", func(t *testing.T) {
+	// Case 3: the emptyDir has the default medium, which Kata places on its
+	// virtio-fs share, where the worker's overlay rootfs fails to mount.
+	t.Run("rejects a pod whose ate-base emptyDir has the default medium", func(t *testing.T) {
 		ps := networkPodSpec(t, buildNetworkPool(nil))
 		v := ateBaseVolumeOf(ps)
 		if v == nil || v.EmptyDir == nil {
 			t.Fatal("real network pod unexpectedly has no ate-base emptyDir")
 		}
-		v.EmptyDir.WithMedium(corev1.StorageMediumMemory)
-		if reason := ateBaseIsDefaultEmptyDirAtBasePath(ps); reason == "" {
-			t.Error("invariant accepted a network pod whose ate-base is medium Memory (tmpfs); it must require the default medium")
+		v.EmptyDir.Medium = nil
+		if reason := ateBaseIsMemoryEmptyDirAtBasePath(ps); reason == "" {
+			t.Error("invariant accepted a network pod whose ate-base has the default medium; it must require Memory")
 		}
 	})
 
@@ -425,7 +416,7 @@ func TestNetworkTransportVolumeInvariantRejectsMutants(t *testing.T) {
 			t.Fatal("real network pod unexpectedly has no ate-base emptyDir")
 		}
 		v.EmptyDir.WithSizeLimit(resource.MustParse("1Gi"))
-		if reason := ateBaseIsDefaultEmptyDirAtBasePath(ps); reason == "" {
+		if reason := ateBaseIsMemoryEmptyDirAtBasePath(ps); reason == "" {
 			t.Error("invariant accepted a network pod whose ate-base emptyDir has a sizeLimit; it must reject it")
 		}
 	})
@@ -445,7 +436,7 @@ func TestNetworkTransportVolumeInvariantRejectsMutants(t *testing.T) {
 				}
 			}
 		}
-		if reason := ateBaseIsDefaultEmptyDirAtBasePath(ps); reason == "" {
+		if reason := ateBaseIsMemoryEmptyDirAtBasePath(ps); reason == "" {
 			t.Error("invariant accepted a network pod whose ate-base mount is read-only; it must reject it")
 		}
 	})
