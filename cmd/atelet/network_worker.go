@@ -19,7 +19,9 @@
 // Unix socket (verifyClientOnSameNode) and this file adds nothing to the trust
 // surface. With it set, atelet ALSO serves WorkerSupport over a Pod-to-Pod TCP
 // listener whose authorization is the workertransport PeerPolicy plus the live
-// Kubernetes worker inventory -- never a weaker fallback.
+// Kubernetes worker inventory -- never a weaker fallback. Colocated workers on
+// the same node keep the Unix socket: atelet picks the transport per worker
+// (isNetworkWorker).
 package main
 
 import (
@@ -85,6 +87,13 @@ func newNodeWorkerNetwork(ctx context.Context, client kubernetes.Interface, loca
 		trustPath:      *clientCACerts,
 		serviceAccount: *networkWorkerServiceAccount,
 	}, nil
+}
+
+// isNetworkWorker reports whether uid names a network worker on this node. It
+// is false for every worker when network workers are disabled (n is nil), and
+// for a colocated worker on a node that also runs network workers.
+func (n *nodeWorkerNetwork) isNetworkWorker(uid string) bool {
+	return n != nil && n.directory.Has(uid)
 }
 
 // dial opens an mTLS connection to a network worker Pod, as a client. The pod

@@ -20,59 +20,64 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/connectivity"
+	corev1 "k8s.io/api/core/v1"
 )
 
-// TestDialWorkerPodNetworkResolvesThroughInventory proves that with a network
-// transport set the dialer resolves the worker Pod's endpoint from the live
-// Kubernetes inventory (not from a request) and takes the mTLS branch -- never
-// the Unix-socket fallback. A listed worker resolves to its Pod IP and then
-// reaches the mTLS ClientTLS step (which fails here only because the test does
-// not provide a real credential bundle, proving the network branch was taken
-// rather than the plaintext Unix path, which would have produced a lazy conn
-// and no bundle error).
-func TestDialWorkerPodNetworkResolvesThroughInventory(t *testing.T) {
-	atelet, worker := testIdentities()
-	net := newTestWorkerNetwork(t, atelet, networkWorkerPodFixture(worker))
-	// Point the credential material at a path that does not exist so ClientTLS
-	// fails deterministically: reaching that failure proves the dial took the
-	// mTLS network branch (n.dial -> ClientTLS), because the Unix branch never
-	// loads a bundle.
+// TestDialWorkerPodWithNetworkWorkers covers a dialer with network workers
+// enabled on a node that also runs colocated workers. The inventory lists one
+// running network worker and one that is not running yet.
+//
+// The running network worker resolves to its Pod IP from the live inventory
+// and reaches the mTLS ClientTLS step, which fails here only because the test
+// provides no credential bundle; the Unix branch never loads a bundle. A worker
+// the inventory does not list is colocated and gets the lazy Unix-socket conn,
+// cached under its bare UID. A network worker that is not running fails closed
+// in Resolve, with no Unix fallback.
+func TestDialWorkerPodWithNetworkWorkers(t *testing.T) {
 	oldBundle, oldTrust := *grpcServerCredBundle, *clientCACerts
 	*grpcServerCredBundle = t.TempDir() + "/no-such-bundle.pem"
 	*clientCACerts = t.TempDir() + "/no-such-trust.pem"
 	t.Cleanup(func() { *grpcServerCredBundle, *clientCACerts = oldBundle, oldTrust })
 
-	d := newWorkerDialer(4)
-	d.network = net
-
-	_, err := d.DialWorkerPod(context.Background(), worker.PodUID)
-	if err == nil {
-		t.Fatal("network dial of a listed worker succeeded without a credential bundle; it must have taken the mTLS branch and failed loading the bundle")
-	}
-	if !strings.Contains(err.Error(), "bundle") {
-		t.Fatalf("network dial error = %v; want a credential-bundle load failure proving the mTLS branch was taken (not the Unix fallback)", err)
-	}
-}
-
-// TestDialWorkerPodNetworkFailsClosedForAbsentWorker proves the network dial
-// fails closed: a worker absent from the live inventory (or a colocated worker
-// that never opted into network mode) cannot be dialed, and there is no
-// plaintext or Unix fallback. The error comes from Resolve, before any dial.
-func TestDialWorkerPodNetworkFailsClosedForAbsentWorker(t *testing.T) {
 	atelet, worker := testIdentities()
-	// Seed the inventory with the one real worker, then ask for a different UID.
-	net := newTestWorkerNetwork(t, atelet, networkWorkerPodFixture(worker))
+	pending := worker
+	pending.PodUID, pending.PodName = "pending-worker-uid", "worker-pending"
+	pendingPod := networkWorkerPodFixture(pending)
+	pendingPod.Status.Phase = corev1.PodPending
+	net := newTestWorkerNetwork(t, atelet, networkWorkerPodFixture(worker), pendingPod)
 
-	d := newWorkerDialer(4)
-	d.network = net
-
-	if _, err := d.DialWorkerPod(context.Background(), "not-in-inventory"); err == nil {
-		t.Fatal("network dial of a worker absent from the inventory succeeded; it must fail closed")
-	}
-	// A conn must NOT have been cached under the absent UID: a failed resolve
-	// adds nothing.
-	if _, ok := d.conns.Get("not-in-inventory"); ok {
-		t.Fatal("a failed network resolve cached a connection")
+	for _, tc := range []struct {
+		name    string
+		uid     string
+		wantErr string // substring of the dial error; empty when the dial succeeds
+	}{
+		{"colocated worker dials the Unix socket", "colocated-pod", ""},
+		{"network worker dials over mTLS", worker.PodUID, "bundle"},
+		{"network worker that is not running fails closed", pending.PodUID, "not active"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newWorkerDialer(4)
+			d.network = net
+			conn, err := d.DialWorkerPod(context.Background(), tc.uid)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("DialWorkerPod(%q) error = %v, want one containing %q", tc.uid, err, tc.wantErr)
+				}
+				if n := d.conns.Len(); n != 0 {
+					t.Fatalf("a failed dial cached %d connections", n)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DialWorkerPod(%q) error = %v, want the Unix-socket conn", tc.uid, err)
+			}
+			if got := conn.GetState(); got == connectivity.Shutdown {
+				t.Fatal("colocated conn is shut down; want a live lazy conn")
+			}
+			if _, ok := d.conns.Get(tc.uid); !ok {
+				t.Fatal("colocated dial did not cache under the bare pod UID")
+			}
+		})
 	}
 }
 

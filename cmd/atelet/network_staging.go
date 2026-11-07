@@ -18,7 +18,8 @@
 // (Run/Restore), and pulling the guest's checkpoint files OUT into node custody
 // after a checkpoint and before the guest is removed. A colocated worker shares
 // the node's filesystem, so none of this runs for it: every entry point is a
-// no-op when network workers are disabled (s.network == nil).
+// no-op for a worker that is not a network worker (isNetworkWorker), which is
+// every worker when network workers are disabled (s.network == nil).
 //
 // Generation (worker-derived): worker lifecycle requests carry no activation
 // generation, and the worker derives the generation it serves
@@ -223,7 +224,8 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 // enableNetworkWorkers switches the Atelet onto the network-worker path. It is
 // called once at startup, only when --network-workers is set, before any RPC
 // can reach the Atelet, so the fields it sets need no lock. With the flag unset
-// it is never called and every network entry point below stays a no-op.
+// it is never called and every network entry point below stays a no-op. With it
+// set, they act only for network workers.
 func (s *Atelet) enableNetworkWorkers(network *nodeWorkerNetwork) error {
 	if network == nil {
 		return fmt.Errorf("network worker transport is required")
@@ -265,8 +267,8 @@ func (s *Atelet) stagingRPC(ctx context.Context, workerUID string) (pb.WorkerSta
 // validateNetworkSpec rejects a workload spec a network worker cannot serve.
 // A separate guest Pod cannot see the node's CSI mounts, so a node-mounted
 // external volume is refused rather than silently ignored.
-func (s *Atelet) validateNetworkSpec(spec *ateletpb.WorkloadSpec) error {
-	if s.network == nil {
+func (s *Atelet) validateNetworkSpec(workerUID string, spec *ateletpb.WorkloadSpec) error {
+	if !s.network.isNetworkWorker(workerUID) {
 		return nil
 	}
 	for _, volume := range spec.GetVolumes() {
@@ -280,8 +282,8 @@ func (s *Atelet) validateNetworkSpec(spec *ateletpb.WorkloadSpec) error {
 // validateNetworkSandbox refuses a sandbox class the staging path does not yet
 // support. Network-worker staging ships gVisor assets; the microVM runtime is
 // not part of this path.
-func (s *Atelet) validateNetworkSandbox(class string) error {
-	if s.network != nil && class != "gvisor" {
+func (s *Atelet) validateNetworkSandbox(workerUID, class string) error {
+	if s.network.isNetworkWorker(workerUID) && class != "gvisor" {
 		return status.Error(codes.InvalidArgument, "network worker staging currently supports the gvisor sandbox class")
 	}
 	return nil
@@ -319,7 +321,7 @@ func validateNestedSandbox(nested *ateletpb.NestedContainers, class string) erro
 // custody (the UID check). Returns (nil, nil) for a colocated worker, so the
 // Checkpoint handler's pull step is a no-op there.
 func (s *Atelet) networkActivation(actor resources.ActorRef, actorUID, workerUID string) (*pb.ActivationRef, error) {
-	if s.network == nil {
+	if !s.network.isNetworkWorker(workerUID) {
 		return nil, nil
 	}
 	// Hold the per-actor lock so a read cannot observe a half-promoted record
@@ -391,7 +393,7 @@ func (s *Atelet) cleanupNetworkActor(ctx context.Context, ref *pb.ActivationRef)
 // the worker RPC also receives, so the exact runtime binaries the RPC names are
 // the ones staged.
 func (s *Atelet) stageNetworkActivation(ctx context.Context, actor resources.ActorRef, actorUID, workerUID string, assets map[string]string) (*pb.ActivationRef, error) {
-	if s.network == nil {
+	if !s.network.isNetworkWorker(workerUID) {
 		return nil, nil
 	}
 	// Serialize the whole prepare/stage/commit for this actor: two concurrent

@@ -39,6 +39,9 @@ func TestDirectoryUsesPodUIDAndRejectsDeletedOrMisplacedWorkers(t *testing.T) {
 	if err := index.Add(pod); err != nil {
 		t.Fatal(err)
 	}
+	if !directory.Has(identity.PodUID) {
+		t.Fatal("a listed network worker is not in the directory")
+	}
 	address, ns, err := directory.Resolve(identity.PodUID)
 	if err != nil || address != "192.0.2.10:8086" || ns != identity.Namespace {
 		t.Fatalf("resolve: %q %q %v", address, ns, err)
@@ -71,6 +74,9 @@ func TestDirectoryUsesPodUIDAndRejectsDeletedOrMisplacedWorkers(t *testing.T) {
 	if _, _, err := directory.Resolve(identity.PodUID); err == nil {
 		t.Fatal("deleted worker still resolves")
 	}
+	if directory.Has(identity.PodUID) {
+		t.Fatal("deleted worker is still in the directory")
+	}
 	if len(directory.UIDs()) != 0 {
 		t.Fatal("stats inventory retained deleted worker")
 	}
@@ -99,6 +105,9 @@ func TestColocatedWorkerIsNeverInTheNetworkDirectory(t *testing.T) {
 	if err := index.Add(colocated); err != nil {
 		t.Fatal(err)
 	}
+	if directory.Has(identity.PodUID) {
+		t.Fatal("an unannotated colocated worker is in the network directory")
+	}
 	if _, _, err := directory.Resolve(identity.PodUID); err == nil {
 		t.Fatal("an unannotated colocated worker resolved through the network directory")
 	}
@@ -119,6 +128,11 @@ func TestColocatedWorkerIsNeverInTheNetworkDirectory(t *testing.T) {
 	}
 	if _, _, err := directory.Resolve(identity.PodUID); err == nil {
 		t.Fatal("a half-labeled worker resolved through the network directory")
+	}
+	// It is still labeled a network worker, so atelet must not treat it as
+	// colocated: Resolve's error is the only path it gets.
+	if !directory.Has(identity.PodUID) {
+		t.Fatal("a pod labeled as a network worker is not in the directory")
 	}
 	// A pod carrying the network-mode label and an EMPTY worker-pool label is
 	// what the coarse informer selector (which only requires the label to

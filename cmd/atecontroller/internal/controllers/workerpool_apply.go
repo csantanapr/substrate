@@ -747,23 +747,14 @@ func applyNetworkTransport(
 	// pause-container rootfs mount failed with
 	// "filesystem on ... not supported as upperdir".
 	//
-	// Replace the hostPath with an emptyDir of the DEFAULT medium, mounted at
-	// the same path. By the Kubernetes contract a default-medium emptyDir uses
-	// the storage backing the kubelet root directory rather than a tmpfs
-	// (medium Memory). That alone does NOT guarantee a filesystem distinct from
-	// the container's overlay layer -- default storage may be disk, SSD or
-	// network-backed, and the API promises no separate superblock. The
-	// separation this fix relies on is a runtime fact of the sandbox: in this guest the
-	// emptyDir is replicated as a plain directory under the guest root
-	// filesystem (so the upperdir stays out of the container's own overlay
-	// mount), and the live sandbox-runtime re-proof confirms that
-	// backing supports the overlay upperdir. We do NOT claim overlayfs rejects
-	// a tmpfs upperdir (current kernels accept one); we require the default
-	// (non-Memory) medium only to keep the backing off a tmpfs shape we have no
-	// reason to introduce and have not proven. No sizeLimit: runtime assets,
-	// image layers
-	// and actor state all land here, and a small cap would evict them mid-actor;
-	// the guest's own disk pressure bounds it. The worker runs as uid 0
+	// Replace the hostPath with an emptyDir of medium Memory, mounted at the
+	// same path: a tmpfs inside the guest. A default-medium emptyDir is no
+	// fit: Kata (3.32, Cloud Hypervisor, on EKS) places it on the guest's
+	// virtio-fs share, and overlayfs refuses that as an upperdir ("upper fs
+	// missing required features"), while it accepts the guest tmpfs. The
+	// tmpfs is guest memory, so runtime assets, image layers and actor state
+	// count against the worker's memory; size the pool's memory for them. No
+	// sizeLimit: a small cap would evict them mid-actor. The worker runs as uid 0
 	// (podSecurityContext RunAsUser/RunAsGroup 0, set in the base builder), so
 	// it can write the emptyDir root (0777, root) and MkdirAll every subdirectory
 	// it needs -- the same empty starting point a fresh node's
@@ -783,7 +774,7 @@ func applyNetworkTransport(
 	podSpecAC.WithVolumes(
 		corev1ac.Volume().
 			WithName(ateBaseVolume).
-			WithEmptyDir(corev1ac.EmptyDirVolumeSource()),
+			WithEmptyDir(corev1ac.EmptyDirVolumeSource().WithMedium(corev1.StorageMediumMemory)),
 	)
 	containerAC.WithVolumeMounts(
 		corev1ac.VolumeMount().
