@@ -26,11 +26,6 @@
   },
   {
     "rule": "documented",
-    "subject": "substrate.ateapi.v1.ActorTemplate",
-    "message": "message has no doc comment"
-  },
-  {
-    "rule": "documented",
     "subject": "substrate.ateapi.v1.ActorTemplate.containers",
     "message": "field has no doc comment"
   },
