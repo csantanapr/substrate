@@ -83,7 +83,8 @@ func NewDirectory(ctx context.Context, client kubernetes.Interface, local substr
 // fail-closed -- a pod the selector admits but usable rejects enters the index
 // but never resolves, authorizes or lists -- so nothing usable omits can reach
 // a transport. Every path that acts on a pod (pod, Resolve, Authorize, UIDs)
-// goes through usable, never the raw index.
+// goes through usable, never the raw index. Has reads the raw index only to
+// keep a labeled network worker off the colocated path.
 func (d *Directory) usable(pod *corev1.Pod) bool {
 	return pod.UID != "" && pod.Namespace != "" && pod.Name != "" &&
 		pod.Spec.NodeName == d.local.NodeName &&
@@ -91,6 +92,24 @@ func (d *Directory) usable(pod *corev1.Pod) bool {
 		pod.Labels[ModeLabel] == NetworkMode && pod.Labels[WorkerPoolLabel] != "" &&
 		pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning &&
 		net.ParseIP(pod.Status.PodIP) != nil
+}
+
+// Has reports whether uid names a Pod labeled as a network worker, usable or
+// not. Any other UID is a colocated worker. Resolve and Authorize still require
+// a usable Pod, so a network worker that is not running fails there instead of
+// taking the colocated path.
+func (d *Directory) Has(uid string) bool {
+	objects, err := d.index.ByIndex(podUIDIndex, uid)
+	if err != nil {
+		// Resolve reports the error.
+		return true
+	}
+	for _, obj := range objects {
+		if obj.(*corev1.Pod).Labels[ModeLabel] == NetworkMode {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Directory) pod(uid string) (*corev1.Pod, error) {

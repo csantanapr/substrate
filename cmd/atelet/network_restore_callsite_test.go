@@ -17,7 +17,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,146 +66,192 @@ func alignedNodeBase(t *testing.T) string {
 	return base
 }
 
-// TestNetworkRestoreCallSiteStagesLocalSnapshot drives the REAL Atelet.Restore
-// for a network atelet with a usable node-local snapshot (directLocal true) and
-// asserts, at the worker call, (a) RestoreDir is restore-state, (b)
-// PreserveRestoreDir is false, (c) the guest filesystem served by the real
-// staging server holds exactly the manifest's files, sha256-equal to the node's,
-// and (d) the restore's op kind stayed local (metrics).
-func TestNetworkRestoreCallSiteStagesLocalSnapshot(t *testing.T) {
+// TestNetworkRestoreCallSiteLocalSnapshot drives the REAL Atelet.Restore for a
+// network atelet with a usable node-local snapshot (directLocal true).
+//
+// For a network worker it asserts, at the worker call, (a) RestoreDir is
+// restore-state, (b) PreserveRestoreDir is false, and (c) the guest filesystem
+// served by the real staging server holds exactly the manifest's files,
+// sha256-equal to the node's.
+//
+// For a colocated worker on the same atelet, whose dialer shares the network
+// inventory as in production, it asserts the restore dials the Unix-socket
+// worker, stages nothing, and restores in place from the local snapshot with
+// PreserveRestoreDir true.
+func TestNetworkRestoreCallSiteLocalSnapshot(t *testing.T) {
 	const (
 		atespace     = "ate-demo"
 		actorName    = "counter"
 		actorUID     = "01234567-89ab-cdef-0123-456789abcdef"
 		workerPodUID = "5f1c0d2e-3a4b-4c5d-8e9f-0a1b2c3d4e5f"
+		otherUID     = "6a2d1e3f-4b5c-4d6e-9f0a-1b2c3d4e5f60"
 		snapshotName = "pause-snap-1"
 	)
 
-	base := alignedNodeBase(t)
+	for _, tc := range []struct {
+		name string
+		// networkWorker lists workerPodUID in the network inventory. Otherwise
+		// the inventory lists only otherUID, so workerPodUID is colocated.
+		networkWorker bool
+	}{
+		{"network worker stages the snapshot into the guest", true},
+		{"colocated worker restores the snapshot in place", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := alignedNodeBase(t)
 
-	// A MULTI-FILE snapshot with distinct bytes per file: the restore must stage
-	// every listed file into the guest, byte-for-byte. One file would not catch a
-	// defect that stages only the first listed file (or truncates a later one),
-	// so the manifest carries two with different contents.
-	snapshotContents := map[string]string{"checkpoint.img": "guest-memory", "pages.img": "page-table-bytes"}
+			// A MULTI-FILE snapshot with distinct bytes per file: the restore must stage
+			// every listed file into the guest, byte-for-byte. One file would not catch a
+			// defect that stages only the first listed file (or truncates a later one),
+			// so the manifest carries two with different contents.
+			snapshotContents := map[string]string{"checkpoint.img": "guest-memory", "pages.img": "page-table-bytes"}
 
-	// Lifecycle worker (unix socket): records the RestoreWorkload request and
-	// reads the restored files out of the node's RestoreDir.
-	worker := &fakeWorker{snapshotFiles: snapshotContents}
-	serveFakeWorker(t, worker)
+			// Lifecycle worker (unix socket): records the RestoreWorkload request and
+			// reads the restored files out of the node's RestoreDir.
+			worker := &fakeWorker{snapshotFiles: snapshotContents}
+			serveFakeWorker(t, worker)
 
-	// Real staging worker: a SEPARATE guest filesystem reached over the real
-	// workerstaging transport.
-	netW := startNetWorker(t, workerPodUID, "")
+			// Real staging worker: a SEPARATE guest filesystem reached over the real
+			// workerstaging transport.
+			netW := startNetWorker(t, workerPodUID, "")
 
-	// A ZERO-LAYER pause image, so prepareOCIBundles writes an overlay spec with
-	// no image layers. The staging client's canonical-layer check
-	// (internal/workerstaging/client.go: layer must equal
-	// nodepath.BasePath/image-cache/...) then never runs -- that path is pinned
-	// to the const BasePath, which a test cannot write under. The restore path,
-	// the local-snapshot copy into restore-state, the RestoreDir/PreserveRestoreDir
-	// wiring and the actor-state staging into the guest are all exercised; only
-	// the image-layer leg is elided, and it is irrelevant to this fix.
-	host := imageVolumeTestRegistry(t)
-	pinnedImage := pushTestImage(t, host+"/actor:v1")
-	// Upstream #2798 dropped the legacy bare "runsc" asset: a gVisor record now
-	// carries the "gvisor" release tarball. Use the shared tarball fixture.
-	release := newGVisorTestRelease(t)
-	sandboxAssets := &sandboxAssetsRecord{
-		SandboxClass: "gvisor",
-		Assets:       map[string]assetEntry{gvisorAssetName: release.entry},
-	}
-	spec := &ateletpb.WorkloadSpec{
-		Containers: []*ateletpb.Container{{Name: "app", Image: pinnedImage, Command: []string{"/bin/app"}}},
-	}
-	manifestRec := sandboxAssetsRecord{
-		SandboxClass:  "gvisor",
-		Assets:        map[string]assetEntry{gvisorAssetName: release.entry},
-		SnapshotFiles: []string{"checkpoint.img", "pages.img"},
-	}
-
-	imageStore, err := imagecache.New(filepath.Join(base, "image-cache"))
-	if err != nil {
-		t.Fatalf("imagecache.New: %v", err)
-	}
-	assetCache, err := filecache.New(filepath.Join(base, "sandbox-asset-cache"))
-	if err != nil {
-		t.Fatalf("filecache.New: %v", err)
-	}
-	s := &Atelet{
-		checkpointTimeout: defaultCheckpointTimeout,
-		workerDialer:      newWorkerDialer(1), // network nil -> lifecycle dials the unix fakeWorker
-		imageCache:        imageStore,
-		sandboxAssetCache: assetCache,
-		anonGCSClient:     fakeObjectStorage{data: release.tarball},
-		systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
-		snapshots:         snapshottracker.New(t.Context(), nil, clock.RealClock{}),
-		runtimes:          newRuntimeIndex(),
-		network:           &nodeWorkerNetwork{},
-		generations:       newTestGenerations(t, nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}),
-		nodeBase:          base,
-		staging: stagingFunc(func(_ context.Context, uid string) (wspb.WorkerStagingClient, error) {
-			if uid != workerPodUID {
-				t.Fatalf("staging dial for an unexpected worker %q", uid)
+			dialer := newWorkerDialer(1)
+			var inventory *nodeWorkerNetwork
+			if tc.networkWorker {
+				// The lifecycle RPC still reaches the Unix fakeWorker: the dialer has no
+				// network transport because the test has no mTLS worker.
+				inventory = networkFor(t, workerPodUID)
+			} else {
+				inventory = networkFor(t, otherUID)
+				dialer.network = inventory
 			}
-			return netW.staging, nil
-		}),
-	}
-	advertiseRuntime(t, s, sandboxAssets)
 
-	// Seed the node-local snapshot so readLocalSnapshot succeeds and directLocal
-	// is true -- exactly as TestRestorePrefersLocal's "usable local copy" case.
-	localDir := ateletpath.LocalSnapshotDir(actorUID, snapshotName)
-	writeLocalSnapshot(t, localDir, manifestRec, snapshotContents)
+			// A ZERO-LAYER pause image, so prepareOCIBundles writes an overlay spec with
+			// no image layers. The staging client's canonical-layer check
+			// (internal/workerstaging/client.go: layer must equal
+			// nodepath.BasePath/image-cache/...) then never runs -- that path is pinned
+			// to the const BasePath, which a test cannot write under. The restore path,
+			// the local-snapshot copy into restore-state, the RestoreDir/PreserveRestoreDir
+			// wiring and the actor-state staging into the guest are all exercised; only
+			// the image-layer leg is elided, and it is irrelevant to this fix.
+			host := imageVolumeTestRegistry(t)
+			pinnedImage := pushTestImage(t, host+"/actor:v1")
+			// Upstream #2798 dropped the legacy bare "runsc" asset: a gVisor record now
+			// carries the "gvisor" release tarball. Use the shared tarball fixture.
+			release := newGVisorTestRelease(t)
+			sandboxAssets := &sandboxAssetsRecord{
+				SandboxClass: "gvisor",
+				Assets:       map[string]assetEntry{gvisorAssetName: release.entry},
+			}
+			spec := &ateletpb.WorkloadSpec{
+				Containers: []*ateletpb.Container{{Name: "app", Image: pinnedImage, Command: []string{"/bin/app"}}},
+			}
+			manifestRec := sandboxAssetsRecord{
+				SandboxClass:  "gvisor",
+				Assets:        map[string]assetEntry{gvisorAssetName: release.entry},
+				SnapshotFiles: []string{"checkpoint.img", "pages.img"},
+			}
 
-	if _, err := s.Restore(t.Context(), &ateletpb.RestoreRequest{
-		Atespace: atespace, ActorName: actorName, ActorUid: actorUID,
-		ActorTemplateAtespace: "default", ActorTemplateName: "counter",
-		WorkerPodUid:   workerPodUID,
-		SandboxRuntime: runtimeFor(t, sandboxAssets),
-		Spec:           spec,
-		Snapshot:       lifecycleSnapshot(actorUID, snapshotName, 1, ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY),
-	}); err != nil {
-		t.Fatalf("Restore: %v", err)
-	}
+			imageStore, err := imagecache.New(filepath.Join(base, "image-cache"))
+			if err != nil {
+				t.Fatalf("imagecache.New: %v", err)
+			}
+			assetCache, err := filecache.New(filepath.Join(base, "sandbox-asset-cache"))
+			if err != nil {
+				t.Fatalf("filecache.New: %v", err)
+			}
+			s := &Atelet{
+				checkpointTimeout: defaultCheckpointTimeout,
+				workerDialer:      dialer,
+				imageCache:        imageStore,
+				sandboxAssetCache: assetCache,
+				anonGCSClient:     fakeObjectStorage{data: release.tarball},
+				systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
+				snapshots:         snapshottracker.New(t.Context(), nil, clock.RealClock{}),
+				runtimes:          newRuntimeIndex(),
+				network:           inventory,
+				generations:       newTestGenerations(t, nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}),
+				nodeBase:          base,
+				staging: stagingFunc(func(_ context.Context, uid string) (wspb.WorkerStagingClient, error) {
+					if !tc.networkWorker || uid != workerPodUID {
+						t.Errorf("staging dial for worker %q", uid)
+						return nil, errors.New("unexpected staging dial")
+					}
+					return netW.staging, nil
+				}),
+			}
+			advertiseRuntime(t, s, sandboxAssets)
 
-	req := worker.actorDirs["RestoreWorkload"]
-	if req == nil {
-		t.Fatal("RestoreWorkload was never called")
-	}
-	// (a) RestoreDir points at restore-state, not local-checkpoint.
-	if got, want := req.GetRestoreDir(), ateletpath.RestoreStateDir(actorUID); got != want {
-		t.Errorf("RestoreWorkload RestoreDir = %q, want %q (restore-state, the staged dir)", got, want)
-	}
-	// (b) PreserveRestoreDir is false for the network-staged case.
-	if worker.preserveRestoreDir {
-		t.Errorf("RestoreWorkload PreserveRestoreDir = true, want false for a network-staged restore")
-	}
-	// (c) the guest filesystem (separate from the node's) holds EVERY one of the
-	// manifest's files, each byte-identical to the node's local snapshot. Looping
-	// over all listed files (not just the first) is what catches a defect that
-	// stages only the leading file or truncates a later one -- the multi-file
-	// byte-continuity property the folded helper test used to cover.
-	guest := guestRestoreState(netW.base, actorUID)
-	for _, name := range manifestRec.SnapshotFiles {
-		wantBytes, err := os.ReadFile(filepath.Join(localDir, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		gotBytes, err := os.ReadFile(filepath.Join(guest, name))
-		if err != nil {
-			t.Fatalf("guest restore-state missing %q: %v", name, err)
-		}
-		if sha256.Sum256(gotBytes) != sha256.Sum256(wantBytes) {
-			t.Errorf("guest %q sha256 != node local snapshot's", name)
-		}
-	}
-	entries, err := os.ReadDir(guest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != len(manifestRec.SnapshotFiles) {
-		t.Errorf("guest restore-state has %d entries, want exactly the %d manifest files", len(entries), len(manifestRec.SnapshotFiles))
+			// Seed the node-local snapshot so readLocalSnapshot succeeds and directLocal
+			// is true -- exactly as TestRestorePrefersLocal's "usable local copy" case.
+			localDir := ateletpath.LocalSnapshotDir(actorUID, snapshotName)
+			writeLocalSnapshot(t, localDir, manifestRec, snapshotContents)
+
+			if _, err := s.Restore(t.Context(), &ateletpb.RestoreRequest{
+				Atespace: atespace, ActorName: actorName, ActorUid: actorUID,
+				ActorTemplateAtespace: "default", ActorTemplateName: "counter",
+				WorkerPodUid:   workerPodUID,
+				SandboxRuntime: runtimeFor(t, sandboxAssets),
+				Spec:           spec,
+				Snapshot:       lifecycleSnapshot(actorUID, snapshotName, 1, ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY),
+			}); err != nil {
+				t.Fatalf("Restore: %v", err)
+			}
+
+			req := worker.actorDirs["RestoreWorkload"]
+			if req == nil {
+				t.Fatal("RestoreWorkload was never called")
+			}
+			if !tc.networkWorker {
+				if got := req.GetRestoreDir(); got != localDir {
+					t.Errorf("RestoreWorkload RestoreDir = %q, want the local snapshot %q", got, localDir)
+				}
+				if !worker.preserveRestoreDir {
+					t.Error("RestoreWorkload PreserveRestoreDir = false, want true for an in-place restore")
+				}
+				if !maps.Equal(worker.restored, snapshotContents) {
+					t.Errorf("worker restored %v, want %v", worker.restored, snapshotContents)
+				}
+				if _, err := os.Stat(guestRestoreState(netW.base, actorUID)); !os.IsNotExist(err) {
+					t.Errorf("guest restore-state exists for a colocated worker (stat err = %v)", err)
+				}
+				return
+			}
+			// (a) RestoreDir points at restore-state, not local-checkpoint.
+			if got, want := req.GetRestoreDir(), ateletpath.RestoreStateDir(actorUID); got != want {
+				t.Errorf("RestoreWorkload RestoreDir = %q, want %q (restore-state, the staged dir)", got, want)
+			}
+			// (b) PreserveRestoreDir is false for the network-staged case.
+			if worker.preserveRestoreDir {
+				t.Errorf("RestoreWorkload PreserveRestoreDir = true, want false for a network-staged restore")
+			}
+			// (c) the guest filesystem (separate from the node's) holds EVERY one of the
+			// manifest's files, each byte-identical to the node's local snapshot. Looping
+			// over all listed files (not just the first) is what catches a defect that
+			// stages only the leading file or truncates a later one -- the multi-file
+			// byte-continuity property the folded helper test used to cover.
+			guest := guestRestoreState(netW.base, actorUID)
+			for _, name := range manifestRec.SnapshotFiles {
+				wantBytes, err := os.ReadFile(filepath.Join(localDir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				gotBytes, err := os.ReadFile(filepath.Join(guest, name))
+				if err != nil {
+					t.Fatalf("guest restore-state missing %q: %v", name, err)
+				}
+				if sha256.Sum256(gotBytes) != sha256.Sum256(wantBytes) {
+					t.Errorf("guest %q sha256 != node local snapshot's", name)
+				}
+			}
+			entries, err := os.ReadDir(guest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != len(manifestRec.SnapshotFiles) {
+				t.Errorf("guest restore-state has %d entries, want exactly the %d manifest files", len(entries), len(manifestRec.SnapshotFiles))
+			}
+		})
 	}
 }
 
@@ -263,7 +311,7 @@ func TestNetworkRestoreCallSiteFailsClosedOnCopyError(t *testing.T) {
 		systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
 		snapshots:         snapshottracker.New(t.Context(), nil, clock.RealClock{}),
 		runtimes:          newRuntimeIndex(),
-		network:           &nodeWorkerNetwork{},
+		network:           networkFor(t, workerPodUID),
 		generations:       newTestGenerations(t, nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}),
 		nodeBase:          base,
 		staging: stagingFunc(func(_ context.Context, uid string) (wspb.WorkerStagingClient, error) {

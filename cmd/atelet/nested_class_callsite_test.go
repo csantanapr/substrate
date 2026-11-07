@@ -32,7 +32,8 @@ import (
 // These tests pin the CALL SITES of the sandbox-class guards in Run and
 // Restore, not just the helper functions. Removing the validateNestedSandbox
 // call in Run, or in Restore, or either validateNetworkSandbox call, must make
-// the matching case here fail -- proven by four call-site variants. Each
+// the matching case here fail -- proven by four call-site variants. The
+// validateNetworkSpec calls are pinned the same way. Each
 // rejection is checked to happen BEFORE any
 // on-node work (no asset download, no actor dir), the same bar
 // TestRunRejectsUnadvertisedRuntime holds, because a guard that fired only
@@ -48,8 +49,8 @@ const callsiteImage = "example.com/app@sha256:e3b0c44298fc1c149afbf4c8996fb92427
 
 // classAtelet builds an Atelet whose asset fetches are counted, advertises a
 // runtime of the named class, and returns the matching SandboxAssets plus the
-// fetch counter. network=true makes it a network atelet so validateNetworkSandbox
-// is active.
+// fetch counter. network=true makes it a network atelet whose inventory lists
+// callsiteWorkerUID, so validateNetworkSandbox is active for it.
 func classAtelet(t *testing.T, class string, network bool) (*Atelet, *sandboxAssetsRecord, *atomic.Int32) {
 	t.Helper()
 	useTempNodeDirs(t)
@@ -70,7 +71,7 @@ func classAtelet(t *testing.T, class string, network bool) (*Atelet, *sandboxAss
 		snapshots:         snapshottracker.New(t.Context(), nil, clock.RealClock{}),
 	}
 	if network {
-		s.network = &nodeWorkerNetwork{}
+		s.network = networkFor(t, callsiteWorkerUID)
 	}
 	assets := &sandboxAssetsRecord{
 		SandboxClass: class,
@@ -165,6 +166,51 @@ func TestRestoreNetworkUnsupportedClassRefused(t *testing.T) {
 		t.Fatalf("Restore network non-gvisor = %v (code %s), want InvalidArgument from validateNetworkSandbox", err, status.Code(err))
 	}
 	assertNoOnNodeWork(t, gets)
+}
+
+// TestNetworkExternalVolumeRefusedAtCallSites: the validateNetworkSpec calls in
+// Run and Restore refuse a node-mounted external volume for a network worker,
+// before any work. The class is gvisor, so only validateNetworkSpec can be the
+// rejecter.
+func TestNetworkExternalVolumeRefusedAtCallSites(t *testing.T) {
+	spec := &ateletpb.WorkloadSpec{
+		Containers: []*ateletpb.Container{{Name: "app", Image: callsiteImage}},
+		Volumes: []*ateletpb.Volume{{
+			Name:     "ext",
+			External: &ateletpb.ExternalVolumeSource{StorageVolumeId: "vol-1", VolumeType: "mock-driver"},
+		}},
+	}
+	for _, tc := range []struct {
+		name string
+		call func(*testing.T, *Atelet, *sandboxAssetsRecord) error
+	}{
+		{"Run", func(t *testing.T, s *Atelet, assets *sandboxAssetsRecord) error {
+			_, err := s.Run(t.Context(), &ateletpb.RunRequest{
+				Atespace: "team-a", ActorName: "actor-1", ActorUid: callsiteActorUID, WorkerPodUid: callsiteWorkerUID,
+				SandboxRuntime: runtimeFor(t, assets),
+				Spec:           spec,
+			})
+			return err
+		}},
+		{"Restore", func(t *testing.T, s *Atelet, assets *sandboxAssetsRecord) error {
+			_, err := s.Restore(t.Context(), &ateletpb.RestoreRequest{
+				Atespace: "team-a", ActorName: "actor-1", ActorUid: callsiteActorUID, WorkerPodUid: callsiteWorkerUID,
+				SandboxRuntime: runtimeFor(t, assets),
+				Spec:           spec,
+				Snapshot:       lifecycleSnapshot(callsiteActorUID, "snap-1", 1, ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY),
+			})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, assets, gets := classAtelet(t, "gvisor", true)
+			err := tc.call(t, s, assets)
+			if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "node-mounted external CSI volumes") {
+				t.Fatalf("%s network external volume = %v (code %s), want InvalidArgument from validateNetworkSpec", tc.name, err, status.Code(err))
+			}
+			assertNoOnNodeWork(t, gets)
+		})
+	}
 }
 
 // TestRunNestedOnGvisorPassesGuards: the accepting case -- a gVisor-resolved

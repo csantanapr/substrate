@@ -73,7 +73,7 @@ func newNetworkRestoreAtelet(t *testing.T, w *netWorker, workerUID string) *Atel
 	t.Cleanup(func() { nodepath.ActorsDir, nodepath.SnapshotsDir = orig, origSnapshots })
 	s := &Atelet{
 		checkpointTimeout: defaultCheckpointTimeout,
-		network:           &nodeWorkerNetwork{},
+		network:           networkFor(t, workerUID),
 		generations:       newTestGenerations(t, nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}),
 		nodeBase:          root,
 		staging: stagingFunc(func(_ context.Context, uid string) (wspb.WorkerStagingClient, error) {

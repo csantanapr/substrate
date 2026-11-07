@@ -93,7 +93,7 @@ func TestNetworkCheckpointUploadContainsFsFiles(t *testing.T) {
 	w := startFsNetWorker(t, workerUID, reported)
 	s := &Atelet{
 		checkpointTimeout: defaultCheckpointTimeout,
-		network:           &nodeWorkerNetwork{},
+		network:           networkFor(t, workerUID),
 		generations:       newTestGenerations(t, nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}),
 		nodeBase:          nodeBase,
 		staging: stagingFunc(func(_ context.Context, uid string) (wspb.WorkerStagingClient, error) {
@@ -194,7 +194,7 @@ func TestNetworkCheckpointFailedPullLeavesPreviousCustodyIntact(t *testing.T) {
 
 	s := &Atelet{
 		checkpointTimeout: defaultCheckpointTimeout,
-		network:           &nodeWorkerNetwork{},
+		network:           networkFor(t, workerUID),
 		generations:       newTestGenerations(t, nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}),
 		nodeBase:          nodeBase,
 	}

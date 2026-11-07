@@ -40,11 +40,11 @@ func newTestGenerations(t *testing.T, node nodeIdentity) *networkGenerations {
 // worker UID -- so a Checkpoint cannot pull another actor's custody.
 func TestNetworkActivationMatchesTheRightActorAndWorker(t *testing.T) {
 	node := nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}
-	s := &Atelet{network: &nodeWorkerNetwork{}, generations: newTestGenerations(t, node)}
-
 	actor := resources.ActorRef{Atespace: "team", Name: "counter"}
 	actorUID := "11111111-1111-1111-1111-111111111111"
 	workerUID := "22222222-2222-2222-2222-222222222222"
+	otherWorkerUID := "33333333-3333-3333-3333-333333333333"
+	s := &Atelet{network: networkFor(t, workerUID, otherWorkerUID), generations: newTestGenerations(t, node)}
 
 	record, err := s.generations.preparePending(actor, actorUID, workerUID)
 	if err != nil {
@@ -71,7 +71,7 @@ func TestNetworkActivationMatchesTheRightActorAndWorker(t *testing.T) {
 	}{
 		"different actor name":     {resources.ActorRef{Atespace: "team", Name: "other"}, actorUID, workerUID},
 		"different atespace":       {resources.ActorRef{Atespace: "other", Name: "counter"}, actorUID, workerUID},
-		"different worker UID":     {actor, actorUID, "33333333-3333-3333-3333-333333333333"},
+		"different worker UID":     {actor, actorUID, otherWorkerUID},
 		"different (absent) actor": {actor, "44444444-4444-4444-4444-444444444444", workerUID},
 	} {
 		if _, err := s.networkActivation(mut.actor, mut.actorUID, mut.workerUID); err == nil {
@@ -85,10 +85,10 @@ func TestNetworkActivationMatchesTheRightActorAndWorker(t *testing.T) {
 // generation -- so a pull cannot run against an actor that was never staged.
 func TestNetworkActivationFailsClosedWithoutARecord(t *testing.T) {
 	node := nodeIdentity{NodeName: "node-a", NodeUID: "node-a-incarnation"}
-	s := &Atelet{network: &nodeWorkerNetwork{}, generations: newTestGenerations(t, node)}
 	actor := resources.ActorRef{Atespace: "team", Name: "counter"}
 	actorUID := "11111111-1111-1111-1111-111111111111"
 	workerUID := "22222222-2222-2222-2222-222222222222"
+	s := &Atelet{network: networkFor(t, workerUID), generations: newTestGenerations(t, node)}
 	if _, err := s.networkActivation(actor, actorUID, workerUID); err == nil {
 		t.Fatal("networkActivation returned a ref for an actor with no persisted generation")
 	}

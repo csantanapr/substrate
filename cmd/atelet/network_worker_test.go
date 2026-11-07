@@ -78,6 +78,21 @@ func newTestWorkerNetwork(t *testing.T, atelet substratex509.PodIdentity, pods .
 	return net
 }
 
+// networkFor builds a nodeWorkerNetwork whose inventory lists exactly the given
+// worker Pod UIDs as running network workers on this node. Any other UID is a
+// colocated worker.
+func networkFor(t *testing.T, workerUIDs ...string) *nodeWorkerNetwork {
+	t.Helper()
+	atelet, worker := testIdentities()
+	pods := make([]*corev1.Pod, 0, len(workerUIDs))
+	for _, uid := range workerUIDs {
+		w := worker
+		w.PodUID, w.PodName = uid, "worker-"+uid
+		pods = append(pods, networkWorkerPodFixture(w))
+	}
+	return newTestWorkerNetwork(t, atelet, pods...)
+}
+
 func TestAuthorizeWorkerGatesMethodsAndInventory(t *testing.T) {
 	atelet, worker := testIdentities()
 	net := newTestWorkerNetwork(t, atelet, networkWorkerPodFixture(worker))

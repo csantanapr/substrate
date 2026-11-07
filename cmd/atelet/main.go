@@ -477,6 +477,7 @@ func main() {
 	// Atelet staging path). newNodeWorkerNetwork returns nil when
 	// --network-workers is unset, so with the flag off nothing changes: the
 	// dialer keeps its Unix-socket path and the Atelet takes no network path.
+	// With it set, only the workers the inventory lists take the network path.
 	workerNet, err := newNodeWorkerNetwork(ctx, k8sClient, ateletIdentity)
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to set up network worker transport", err)
@@ -838,7 +839,8 @@ type Atelet struct {
 	// network and generations are nil by default (colocated workers). When
 	// --network-workers is set, enableNetworkWorkers wires them so the staging
 	// path (push assets in, pull a checkpoint out, persist the generation)
-	// engages for workers that run in a separate guest Pod. Set once at
+	// engages for workers that run in a separate guest Pod. A request for a
+	// colocated worker on the same node skips it (isNetworkWorker). Set once at
 	// startup before any RPC can reach the Atelet, so they need no lock.
 	network     *nodeWorkerNetwork
 	generations *networkGenerations
@@ -914,7 +916,7 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 	if errs := apivalidation.ValidateRunRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
 	}
-	if err := s.validateNetworkSpec(req.GetSpec()); err != nil {
+	if err := s.validateNetworkSpec(req.GetWorkerPodUid(), req.GetSpec()); err != nil {
 		return nil, err
 	}
 
@@ -933,7 +935,7 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 		return nil, err
 	}
 	defer unlockActor()
-	if err := s.validateNetworkSandbox(sandboxRec.SandboxClass); err != nil {
+	if err := s.validateNetworkSandbox(req.GetWorkerPodUid(), sandboxRec.SandboxClass); err != nil {
 		return nil, err
 	}
 	// A nested-containers opt-in is honored only by ateworker-gvisor. The
@@ -1799,7 +1801,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	if errs := apivalidation.ValidateRestoreRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
 	}
-	if err := s.validateNetworkSpec(req.GetSpec()); err != nil {
+	if err := s.validateNetworkSpec(req.GetWorkerPodUid(), req.GetSpec()); err != nil {
 		return nil, err
 	}
 
@@ -1816,7 +1818,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	if err != nil {
 		return nil, err
 	}
-	if err := s.validateNetworkSandbox(runtimeRec.SandboxClass); err != nil {
+	if err := s.validateNetworkSandbox(req.GetWorkerPodUid(), runtimeRec.SandboxClass); err != nil {
 		return nil, err
 	}
 	// Same nested-opt-in-requires-gVisor guard as Run (see validateNestedSandbox):
@@ -1970,9 +1972,9 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	// network worker, stage the verified local snapshot into restore-state (which IS pushed) by
 	// copying EXACTLY the manifest's files, point RestoreDir there, and tell the worker NOT to
 	// preserve that dir (the guest copy is disposable; the node's local snapshot is untouched).
-	// op.kind stays local. The COLOCATED path is unchanged (networkLocalStage is false when
-	// s.network == nil), so it still restores in place with PreserveRestoreDir=true and no staging.
-	networkLocalStage := wantsNetworkLocalStage(directLocal, s.network != nil)
+	// op.kind stays local. The COLOCATED path is unchanged (networkLocalStage is false for a
+	// colocated worker), so it still restores in place with PreserveRestoreDir=true and no staging.
+	networkLocalStage := wantsNetworkLocalStage(directLocal, s.network.isNetworkWorker(req.GetWorkerPodUid()))
 	if networkLocalStage {
 		// Stage into restore-state (in actorRoots -> pushed to the guest), not local-checkpoint.
 		checkpointDir = ateletpath.RestoreStateDir(actorUID)
@@ -2449,13 +2451,13 @@ func (s *Atelet) terminateWorkloadOnWorker(ctx context.Context, req *ateletpb.Te
 
 // wantsNetworkLocalStage reports whether a directLocal restore must stage the
 // node-local snapshot into restore-state for a network worker. It is true ONLY for a directLocal restore on a
-// network worker: a colocated worker (networkEnabled false) shares the node
+// network worker: a colocated worker (networkWorker false) shares the node
 // filesystem and restores in place, and a non-directLocal restore already
 // downloads into restore-state. Extracted as a pure function so the gating that
 // drives both the restore-state staging AND PreserveRestoreDir below is tested
 // directly, both ways, independent of the staging machinery.
-func wantsNetworkLocalStage(directLocal, networkEnabled bool) bool {
-	return directLocal && networkEnabled
+func wantsNetworkLocalStage(directLocal, networkWorker bool) bool {
+	return directLocal && networkWorker
 }
 
 // preserveRestoreDirForLocal is the PreserveRestoreDir the worker RestoreWorkload
@@ -2719,9 +2721,10 @@ type WorkerDialer struct {
 	conns *lru.Cache
 	// network is nil by default (colocated workers over the Unix socket). When
 	// --network-workers is set it is the node-scoped network-worker inventory
-	// and mTLS dialer; DialWorkerPod then dials a worker Pod over authenticated
-	// Pod networking instead of the Unix socket. Set once at startup, before any
-	// RPC can reach the dialer, so it needs no lock.
+	// and mTLS dialer; DialWorkerPod then dials a network worker Pod over
+	// authenticated Pod networking, and a colocated worker over the Unix socket
+	// as before. Set once at startup, before any RPC can reach the dialer, so it
+	// needs no lock.
 	network *nodeWorkerNetwork
 }
 
@@ -2752,11 +2755,12 @@ var workerSocketPath = nodepath.WorkerSocketPath
 
 func (d *WorkerDialer) DialWorkerPod(ctx context.Context, podUID string) (*grpc.ClientConn, error) {
 	key := podUID
-	if d.network != nil {
+	network := d.network.isNetworkWorker(podUID)
+	if network {
 		// Key the cache by UID AND the resolved address so a worker Pod replaced
 		// at the same UID (which cannot happen) or a stale entry cannot alias a
-		// different endpoint. Resolve fails closed for a worker not in the live
-		// inventory, so a colocated or absent worker never reaches the dial.
+		// different endpoint. Resolve fails closed for a network worker that is
+		// not usable, so it never falls back to the Unix socket.
 		address, _, err := d.network.directory.Resolve(podUID)
 		if err != nil {
 			return nil, err
@@ -2771,10 +2775,9 @@ func (d *WorkerDialer) DialWorkerPod(ctx context.Context, podUID string) (*grpc.
 
 	var conn *grpc.ClientConn
 	var err error
-	if d.network != nil {
+	if network {
 		// Network worker: mTLS over Pod networking, no plaintext or Unix
-		// fallback. The byte-for-byte unchanged Unix path below is taken only
-		// when network workers are disabled.
+		// fallback. A colocated worker takes the unchanged Unix path below.
 		conn, err = d.network.dial(podUID)
 	} else {
 		conn, err = grpc.NewClient(
