@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"go.ate.dev/substrate/internal/installdefaults"
@@ -188,5 +190,45 @@ func TestNetworkWorkersOffByDefaultAddsNothing(t *testing.T) {
 func TestNetworkWorkerServiceAccountDefaultMatchesTheControllersWorkerAccount(t *testing.T) {
 	if got, want := *networkWorkerServiceAccount, installdefaults.WorkerServiceAccount; got != want {
 		t.Fatalf("--network-worker-service-account defaults to %q, but the controller runs worker Pods as %q: a default install would refuse every network worker", got, want)
+	}
+}
+
+// Terminate tears a workload down only on a worker that is still there. A
+// network worker has no socket on the node, so its presence comes from the
+// worker inventory, and a colocated worker on the same node keeps the socket.
+func TestWorkerPresent(t *testing.T) {
+	atelet, worker := testIdentities()
+	stopped := worker
+	stopped.PodUID, stopped.PodName = "stopped-uid", "worker-stopped"
+	stoppedPod := networkWorkerPodFixture(stopped)
+	stoppedPod.Status.Phase = corev1.PodSucceeded
+
+	sockets := t.TempDir()
+	orig := workerSocketPath
+	workerSocketPath = func(uid string) string { return filepath.Join(sockets, uid+".sock") }
+	t.Cleanup(func() { workerSocketPath = orig })
+	if err := os.WriteFile(workerSocketPath("colocated-up"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Atelet{network: newTestWorkerNetwork(t, atelet, networkWorkerPodFixture(worker), stoppedPod)}
+	for _, tt := range []struct {
+		name, uid string
+		want      bool
+	}{
+		{"running network worker with no socket", worker.PodUID, true},
+		{"network worker that is not running", stopped.PodUID, false},
+		{"colocated worker with a socket", "colocated-up", true},
+		{"colocated worker without a socket", "colocated-gone", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := s.workerPresent(tt.uid)
+			if err != nil {
+				t.Fatalf("workerPresent: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("workerPresent(%q) = %v, want %v", tt.uid, got, tt.want)
+			}
+		})
 	}
 }

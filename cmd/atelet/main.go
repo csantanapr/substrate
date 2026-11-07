@@ -2378,19 +2378,11 @@ func (s *Atelet) terminateWorkloadOnWorker(ctx context.Context, req *ateletpb.Te
 			slog.Any("actor", actorRef), slog.String("actorUID", actorUID))
 		return nil
 	}
-	// The socket is the worker's liveness. The worker removes its socket on a
-	// graceful exit, and workerSandboxSyncer removes the pod's directory once
-	// the pod is deleted, so the common pod-is-gone path finds no socket and
-	// does no other work; in particular, it never reaches ensureSandboxAssets,
-	// which would fetch binaries for a sandbox that no longer exists. After an
-	// ungraceful exit the socket can outlive the pod until the syncer removes
-	// the directory: that path does reach ensureSandboxAssets, and since the
-	// dial is lazy, TerminateWorkload then fails with Unavailable, which is
-	// tolerated below.
-	if _, err := os.Stat(workerSocketPath(workerPodUID)); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("failed to stat the worker socket during terminate (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
-		}
+	present, err := s.workerPresent(workerPodUID)
+	if err != nil {
+		return fmt.Errorf("failed to check the worker during terminate (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
+	}
+	if !present {
 		slog.InfoContext(ctx, "worker is gone during terminate; reclaiming the actor's node state without a sandbox teardown",
 			slog.Any("actor", actorRef), slog.String("actorUID", actorUID), slog.String("workerPodUID", workerPodUID))
 		return nil
@@ -2447,6 +2439,36 @@ func (s *Atelet) terminateWorkloadOnWorker(ctx context.Context, req *ateletpb.Te
 		}
 	}
 	return nil
+}
+
+// workerPresent reports whether the worker Pod is still there for Terminate to
+// tear down.
+//
+// A colocated worker's socket is its liveness. The worker removes its socket on
+// a graceful exit, and workerSandboxSyncer removes the pod's directory once the
+// pod is deleted, so the common pod-is-gone path finds no socket and does no
+// other work; in particular, it never reaches ensureSandboxAssets, which would
+// fetch binaries for a sandbox that no longer exists. After an ungraceful exit
+// the socket can outlive the pod until the syncer removes the directory: that
+// path does reach ensureSandboxAssets, and since the dial is lazy,
+// TerminateWorkload then fails with Unavailable, which Terminate tolerates.
+//
+// A network worker has no socket on the node. Its liveness is the worker
+// inventory: Resolve admits only a running Pod, so a deleted, terminating or
+// failed worker Pod is gone. A running one that exits during the call fails
+// TerminateWorkload with Unavailable, as above.
+func (s *Atelet) workerPresent(workerPodUID string) (bool, error) {
+	if s.network.isNetworkWorker(workerPodUID) {
+		_, _, err := s.network.directory.Resolve(workerPodUID)
+		return err == nil, nil
+	}
+	if _, err := os.Stat(workerSocketPath(workerPodUID)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // wantsNetworkLocalStage reports whether a directLocal restore must stage the
